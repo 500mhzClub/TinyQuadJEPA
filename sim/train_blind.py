@@ -1,195 +1,124 @@
 #!/usr/bin/env python3
-"""
-PROJECT CERBERUS: PPO BLIND WALKER (Genesis 0.3.14 | gs.vulkan)
-
-FULL REGEN (stable):
-
-Fixes baked in:
-1) Scene.build(): env_spacing MUST be a tuple (x, y)               -> ENV_SPACING="2.5,2.5"
-2) RigidEntity has NO set_qvel() in 0.3.14                         -> use set_dofs_velocity() on base DOFs (0..5)
-3) RigidEntity.is_free property is REMOVED and raises DeprecationError
-   -> never access is_free; just try/except base kick
-4) PPO autograd bug ("backward through graph a second time")
-   -> rollout/GAE/returns are STRICTLY no-grad + detached (+ clones)
-5) BIG PRACTICAL FIX: reset now hard-resets BASE pose/orientation and velocities
-   -> prevents learning from being stuck inverted on the floor
-6) Reward includes a height term centered at nominal base height
-
-Your command works as-is:
-  ENV_SPACING="2.5,2.5" CURRICULUM=1 STAND_UPDATES=0 FWD_RAMP_UPDATES=400 UPRIGHT_DECAY=0.3 \
-  ACTION_SCALE=0.65 POSE_PENALTY=1e-4 ALIVE_BONUS=0.0 FWD_SCALE=3.0 ENT_COEF=0.02 \
-  YAW_PENALTY=0.1 SIDE_PENALTY=0.1 python3 sim/train_blind.py
-
-Useful knobs:
-  ENVS=1024
-  DT=0.01
-  FORCE_LIMIT=30
-  ROLLOUT_T=256
-  UPDATE_EPOCHS=4
-  HIDDEN=256
-  LR=3e-4
-  KICK_AFTER_UPDATES=500    (disable kicks early; helps learn standing)
-  CLONE_ROLLOUT=1           (recommended; avoids any sim-buffer aliasing)
-  FALL_H=0.10               (termination height)
-  EP_LEN=800
-  SEED=0
-  URDF=./assets/mini_pupper/mini_pupper.urdf
-"""
-
 from __future__ import annotations
 
-import os
-import math
-import random
-from dataclasses import dataclass
-from typing import Tuple
+"""
+train_blind.py — Mini Pupper PPO in Genesis (proprio-only), with robust video recording.
 
+Fixes (standing-still exploit & Stability):
+1) Stability Tuning:
+   - LOWERED KP from 45.0 to 5.0 (Critical for Mini Pupper mass/inertia).
+   - LOWERED KV from 2.5 to 0.5.
+   - LOWERED spawn height from 0.25m to 0.12m to prevent impact shocks.
+2) Forward objective is primary:
+   - Reward uses BODY-FRAME forward velocity (yaw-invariant).
+   - Command-conditioned target speed cmd_vx is sampled per-episode and included in obs.
+3) Anti-stall shaping:
+   - Penalty when vfwd stays below VX_MIN after a short grace period.
+   - Optional termination if stalled too long (counted only after grace).
+
+Video robustness:
+- Recording runs in a subprocess (--record-only) so GL/EGL failures never kill training.
+- Video recording now includes a "settle" phase so the robot doesn't drop from the sky.
+"""
+
+import os
+import sys
+
+# ---------------------------------------------------------------------
+# MUST be set BEFORE importing genesis/pyrender/OpenGL in the record subprocess
+# ---------------------------------------------------------------------
+if "--record-only" in sys.argv:
+    os.environ.setdefault("PYOPENGL_PLATFORM", os.getenv("VIDEO_PYOPENGL_PLATFORM", "egl"))
+    os.environ.setdefault("EGL_PLATFORM", os.getenv("VIDEO_EGL_PLATFORM", "surfaceless"))
+
+import time
+import argparse
+import subprocess
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple, Dict, Any
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import genesis as gs
 
 
 # -----------------------------
-# Env helpers
+# Small helpers
 # -----------------------------
-def _env_int(name: str, default: int) -> int:
+def env_int(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)).strip())
 
 
-def _env_float(name: str, default: float) -> float:
+def env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)).strip())
 
 
-def _env_bool(name: str, default: str = "0") -> bool:
+def env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _env_str(name: str, default: str) -> str:
-    return os.getenv(name, default).strip()
+def now_tag() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
 
 
-def _env_tuple2(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    for sep in (",", " "):
-        if sep in raw:
-            parts = [p.strip() for p in raw.split(sep) if p.strip()]
-            if len(parts) == 2:
-                return (float(parts[0]), float(parts[1]))
-    s = float(raw)
-    return (s, s)
+def atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x = torch.clamp(x, -1.0 + eps, 1.0 - eps)
+    return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
-def seed_all(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
+    return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
 
 
-# -----------------------------
-# STS3215 Actuator Model (PD + speed-dependent torque limit + latency)
-# -----------------------------
-class STS3215_Actuator:
-    def __init__(self, num_envs: int, device: torch.device, dt: float = 0.01):
-        self.device = device
-        self.num_envs = num_envs
-        self.stall_torque = 3.0
-        self.no_load_speed = 6.0
-        self.dt = dt
-        self.latency_steps = max(1, int(0.02 / dt))
-        self.history_len = self.latency_steps + 1
-        self.command_queue = torch.zeros((num_envs, 12, self.history_len), device=device)
-        self.kp = 45.0
-        self.kd = 1.5
-
-    def step(self, target_pos, current_pos, current_vel, voltage: float = 11.1):
-        with torch.no_grad():
-            if self.history_len > 1:
-                self.command_queue[:, :, :-1] = self.command_queue[:, :, 1:].clone()
-            self.command_queue[:, :, -1] = target_pos.detach()
-            delayed_target = self.command_queue[:, :, 0]
-
-        torque = self.kp * (delayed_target - current_pos) - self.kd * current_vel
-        torque_limit = (self.stall_torque * (voltage / 11.1)) * (1.0 - torch.abs(current_vel) / self.no_load_speed)
-        torque_limit = torque_limit.clamp_min(0.0)
-        return torch.clamp(torque, -torque_limit, torque_limit)
-
-    def reset(self, env_ids: torch.Tensor | None):
-        if env_ids is None:
-            self.command_queue.zero_()
-        else:
-            self.command_queue[env_ids] = 0.0
+def quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    w = aw * bw - ax * bx - ay * by - az * bz
+    x = aw * bx + ax * bw + ay * bz - az * by
+    y = aw * by - ax * bz + ay * bw + az * bx
+    z = aw * bz + ax * by - ay * bx + az * bw
+    return torch.stack([w, x, y, z], dim=-1)
 
 
-# -----------------------------
-# Quaternion helper (wxyz)
-# -----------------------------
-def quat_rotate_wxyz(q, v):
+def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
-    Rotate vector v by quaternion q (wxyz).
-    q: (...,4), v: (...,3)
+    Rotate vector v by quaternion q.
+    q: (N,4) wxyz
+    v: (N,3)
     """
-    q_w, q_vec = q[..., 0:1], q[..., 1:4]
-    t = 2.0 * torch.cross(q_vec, v, dim=-1)
-    return v + q_w * t + torch.cross(q_vec, t, dim=-1)
+    zeros = torch.zeros((v.shape[0], 1), device=v.device, dtype=v.dtype)
+    vq = torch.cat([zeros, v], dim=-1)
+    return quat_mul_wxyz(quat_mul_wxyz(q, vq), quat_conj_wxyz(q))[:, 1:4]
 
 
-# -----------------------------
-# PPO network
-# -----------------------------
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int, log_std_init: float):
-        super().__init__()
-        self.pi = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, act_dim),
-        )
-        self.v = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1),
-        )
-        self.log_std = nn.Parameter(torch.ones(act_dim) * log_std_init)
-
-    def forward(self, obs):
-        mu = self.pi(obs)
-        log_std = self.log_std.expand(obs.shape[0], -1)
-        v = self.v(obs).squeeze(-1)
-        return mu, log_std, v
-
-    @torch.no_grad()
-    def act(self, obs, deterministic: bool = False):
-        mu, log_std, v = self.forward(obs)
-        a = mu if deterministic else mu + log_std.exp() * torch.randn_like(mu)
-        logp = (-0.5 * (((a - mu) ** 2) / (log_std.exp() ** 2 + 1e-8) + 2.0 * log_std + math.log(2.0 * math.pi))).sum(dim=-1)
-        return a, logp, v
+def world_to_body_vec(quat_wxyz: torch.Tensor, vec_world: torch.Tensor) -> torch.Tensor:
+    """
+    Convert world-frame vector to body-frame using q_conj rotation.
+    """
+    return quat_rotate_wxyz(quat_conj_wxyz(quat_wxyz), vec_world)
 
 
-class RunningMeanStd:
-    def __init__(self, shape, device):
-        self.mean = torch.zeros(shape, device=device)
-        self.var = torch.ones(shape, device=device)
-        self.count = torch.tensor(1e-4, device=device)
+def quat_to_euler_wxyz(q: torch.Tensor) -> torch.Tensor:
+    # q: (N,4) wxyz
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
 
-    @torch.no_grad()
-    def update(self, x):
-        m = x.mean(0)
-        v = x.var(0, unbiased=False)
-        c = x.shape[0]
-        delta = m - self.mean
-        tot = self.count + c
-        self.mean += delta * (c / tot)
-        self.var = ((self.var * self.count + v * c + delta**2 * (self.count * c / tot)) / tot).clamp_min(1e-6)
-        self.count = tot
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr_cosp, cosr_cosp)
 
-    @torch.no_grad()
-    def normalize(self, x):
-        return torch.clamp((x - self.mean) / torch.sqrt(self.var + 1e-8), -10, 10)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)
+    pitch = torch.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny_cosp, cosy_cosp)
+
+    return torch.stack([roll, pitch, yaw], dim=-1)
 
 
 # -----------------------------
@@ -197,400 +126,623 @@ class RunningMeanStd:
 # -----------------------------
 @dataclass
 class CFG:
-    # sim
-    envs: int = _env_int("ENVS", 1024)
-    dt: float = _env_float("DT", 0.01)
-    env_spacing: Tuple[float, float] = _env_tuple2("ENV_SPACING", (2.5, 2.5))
+    urdf: str = os.getenv("URDF", "assets/mini_pupper/mini_pupper.urdf")
 
-    # robot/control
-    action_scale: float = _env_float("ACTION_SCALE", 0.65)
-    force_limit: float = _env_float("FORCE_LIMIT", 30.0)
+    n_envs: int = env_int("N_ENVS", 2048)
+    env_spacing: float = env_float("ENV_SPACING", 1.0) # Reduced spacing for small robots
 
-    # shaping / curriculum
-    curriculum: bool = _env_bool("CURRICULUM", "0")
-    stand_updates: int = _env_int("STAND_UPDATES", 0)
-    fwd_scale: float = _env_float("FWD_SCALE", 3.0)
-    fwd_ramp_updates: int = _env_int("FWD_RAMP_UPDATES", 400)
-    upright_decay: float = _env_float("UPRIGHT_DECAY", 0.3)
+    dt: float = env_float("DT", 0.01)
+    substeps: int = env_int("SUBSTEPS", 4)
+    decimation: int = env_int("DECIMATION", 4)
 
-    pose_penalty: float = _env_float("POSE_PENALTY", 1e-4)
-    alive_bonus: float = _env_float("ALIVE_BONUS", 0.0)
-    yaw_penalty: float = _env_float("YAW_PENALTY", 0.1)
-    side_penalty: float = _env_float("SIDE_PENALTY", 0.1)
+    # Stability Tuning: drastically reduced for Mini Pupper scale
+    kp: float = env_float("KP", 5.0)  
+    kv: float = env_float("KV", 0.5)
 
-    # episode termination
-    fall_h: float = _env_float("FALL_H", 0.10)
-    ep_len: int = _env_int("EP_LEN", 800)
+    max_ep_len: int = env_int("MAX_EP_LEN", 800)
 
-    # PPO
-    hidden: int = _env_int("HIDDEN", 256)
-    log_std_init: float = _env_float("LOG_STD_INIT", -1.0)
-    lr: float = _env_float("LR", 3e-4)
-    gamma: float = _env_float("GAMMA", 0.99)
-    lam: float = _env_float("LAMBDA", 0.95)
-    clip: float = _env_float("CLIP", 0.2)
-    vf_coef: float = _env_float("VF_COEF", 0.5)
-    ent_coef: float = _env_float("ENT_COEF", 0.02)
-    update_epochs: int = _env_int("UPDATE_EPOCHS", 4)
-    rollout_T: int = _env_int("ROLLOUT_T", 256)
+    hip_splay: float = env_float("HIP_SPLAY", 0.06)
+    thigh0: float = env_float("THIGH0", 0.85)
+    calf0: float = env_float("CALF0", -1.75)
+    action_scale: float = env_float("ACTION_SCALE", 0.30) # Reduced slightly for safety
 
-    # reset / rollout safety
-    kick_after_updates: int = _env_int("KICK_AFTER_UPDATES", 500)
-    clone_rollout: bool = _env_bool("CLONE_ROLLOUT", "1")
+    min_z: float = env_float("MIN_Z", 0.05)
+    max_tilt: float = env_float("MAX_TILT", 1.0)
+    z_target: float = env_float("Z_TARGET", 0.085)
 
-    # misc
-    seed: int = _env_int("SEED", 0)
+    # command-conditioned forward speed target (m/s), sampled per reset
+    cmd_vx_low: float = env_float("CMD_VX_LOW", 0.25)
+    cmd_vx_high: float = env_float("CMD_VX_HIGH", 0.80)
 
-    # paths
-    urdf: str = _env_str("URDF", "./assets/mini_pupper/mini_pupper.urdf")
+    # reward weights
+    w_fwd: float = env_float("W_FWD", 2.0)
+    w_cmd: float = env_float("W_CMD", 1.0)
+    w_upright: float = env_float("W_UPRIGHT", 0.25)
+    w_height: float = env_float("W_HEIGHT", 0.10)
+
+    # penalties
+    w_energy: float = env_float("W_ENERGY", 2e-4)
+    w_action: float = env_float("W_ACTION", 1e-3)
+    w_smooth: float = env_float("W_SMOOTH", 2e-3)
+
+    # anti-stall
+    vx_min: float = env_float("VX_MIN", 0.12)
+    stall_grace: int = env_int("STALL_GRACE", 10)
+    w_stall: float = env_float("W_STALL", 0.8)
+    stall_terminate: int = env_int("STALL_TERMINATE", 200)
+
+    fall_penalty: float = env_float("FALL_PENALTY", 5.0)
+
+    seed: int = env_int("SEED", 1)
+    total_updates: int = env_int("UPDATES", 20000)
+
+    horizon: int = env_int("HORIZON", 32)
+    gamma: float = env_float("GAMMA", 0.99)
+    lam: float = env_float("LAMBDA", 0.95)
+    clip: float = env_float("CLIP", 0.2)
+    lr: float = env_float("LR", 3e-4)
+    vf_coef: float = env_float("VF_COEF", 0.5)
+    ent_coef: float = env_float("ENT_COEF", 0.01)
+    max_grad_norm: float = env_float("MAX_GRAD_NORM", 1.0)
+
+    ppo_epochs: int = env_int("PPO_EPOCHS", 4)
+    minibatch_size: int = env_int("MINIBATCH", 65536)
+
+    out_dir: str = os.getenv("OUT_DIR", f"runs/pupper_walk_{now_tag()}")
+    save_every: int = env_int("SAVE_EVERY", 100)
+    video_every: int = env_int("VIDEO_EVERY", 200)
+    video_steps: int = env_int("VIDEO_STEPS", 600)
+    video_fps: int = env_int("VIDEO_FPS", 30)
+    video_w: int = env_int("VIDEO_W", 640)
+    video_h: int = env_int("VIDEO_H", 480)
+    record_video: bool = env_bool("RECORD_VIDEO", "1")
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "CFG":
+        c = CFG()
+        for k, v in d.items():
+            if hasattr(c, k):
+                setattr(c, k, v)
+        return c
 
 
 # -----------------------------
-# Genesis Env
+# Mini Pupper batched env
 # -----------------------------
-class BlindWalkerEnv:
-    def __init__(self, cfg: CFG, device: torch.device):
+class MiniPupperBatched:
+    JOINTS_ACTUATED = [
+        "lf_hip_joint", "lh_hip_joint", "rf_hip_joint", "rh_hip_joint",
+        "lf_thigh_joint", "lh_thigh_joint", "rf_thigh_joint", "rh_thigh_joint",
+        "lf_calf_joint", "lh_calf_joint", "rf_calf_joint", "rh_calf_joint",
+    ]
+
+    JOINT_LIMITS = {
+        "hip": (-0.8, 0.8),
+        "thigh": (-1.5, 1.5),
+        "calf": (-2.5, -0.5),
+    }
+
+    def __init__(self, cfg: CFG, with_camera: bool = False, auto_reset: bool = True):
         self.cfg = cfg
-        self.device = device
-        self._global_update = 0
+        self.with_camera = with_camera
+        self.auto_reset = auto_reset
+        self.device = gs.device
+
+        self.n_envs = int(cfg.n_envs)
+        self.num_actions = 12
+
+        self.ep_len = torch.zeros(self.n_envs, device=self.device, dtype=torch.int32)
+        self.prev_action = torch.zeros(self.n_envs, self.num_actions, device=self.device)
+
+        # anti-stall tracking
+        self.stall_steps = torch.zeros(self.n_envs, device=self.device, dtype=torch.int32)
+        self.cmd_vx = torch.zeros(self.n_envs, device=self.device, dtype=torch.float32)
 
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=cfg.dt, substeps=2),
-            rigid_options=gs.options.RigidOptions(gravity=(0, 0, -9.81)),
+            sim_options=gs.options.SimOptions(dt=cfg.dt, substeps=cfg.substeps),
+            show_viewer=False,
+            vis_options=gs.options.VisOptions(
+                plane_reflection=False,
+                show_world_frame=False,
+                show_link_frame=False,
+                show_cameras=False,
+            ),
+            renderer=gs.renderers.Rasterizer(),
         )
         self.scene.add_entity(gs.morphs.Plane())
 
+        # FIX: Lower spawn height to 0.12m to prevent impact explosion
         self.robot = self.scene.add_entity(
-            gs.morphs.URDF(file=cfg.urdf, pos=(0, 0, 0.18)),
-            material=gs.materials.Rigid(),
-        )
-
-        # FIX: env_spacing must be tuple(len=2)
-        self.scene.build(n_envs=cfg.envs, env_spacing=cfg.env_spacing)
-
-        # DOFs: base (0..5) + motors (6..17) for this URDF in Genesis
-        self.base_dofs = torch.arange(0, 6, device=device)
-        self.motor_dofs = torch.arange(6, 18, device=device)
-
-        # Gains for 12 motors
-        self.robot.set_dofs_kp(torch.zeros(12, device=device), self.motor_dofs)
-        self.robot.set_dofs_kv(torch.zeros(12, device=device), self.motor_dofs)
-
-        f_lim = torch.ones(12, device=device) * cfg.force_limit
-        self.robot.set_dofs_force_range(-f_lim, f_lim, self.motor_dofs)
-
-        self.base_link = self.robot.get_link("base_link")
-
-        # Nominal base pose
-        self.base_pos0 = torch.tensor([0.0, 0.0, 0.18], device=device)
-        self.base_quat0 = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)  # wxyz
-
-        # Nominal joint pose (may still exceed limits in URDF -> warning is ok)
-        self.default_dof_pos = torch.tensor([0.0, 0.6, -1.2] * 4, device=device)
-
-        self.actuator = STS3215_Actuator(cfg.envs, device, dt=cfg.dt)
-        self.last_action = torch.zeros((cfg.envs, 12), device=device)
-        self.episode_length = torch.zeros(cfg.envs, device=device)
-
-        self.reset(torch.arange(cfg.envs, device=device))
-
-    def set_update(self, upd: int):
-        self._global_update = upd
-
-    def _set_base_pose(self, env_ids: torch.Tensor):
-        pos = self.base_pos0.expand(len(env_ids), 3).clone()
-        quat = self.base_quat0.expand(len(env_ids), 4).clone()
-
-        # Prefer base_link if it supports set_pos/set_quat (Genesis API can vary)
-        try:
-            self.base_link.set_pos(pos, envs_idx=env_ids)
-            self.base_link.set_quat(quat, envs_idx=env_ids)
-            return
-        except Exception:
-            pass
-
-        # Fallback: entity-level set_pos/set_quat
-        try:
-            self.robot.set_pos(pos, envs_idx=env_ids)
-            self.robot.set_quat(quat, envs_idx=env_ids)
-        except Exception:
-            pass
-
-    def _zero_velocities(self, env_ids: torch.Tensor):
-        # Base velocities (best-effort)
-        try:
-            self.robot.set_dofs_velocity(
-                torch.zeros((len(env_ids), 6), device=self.device),
-                self.base_dofs,
-                envs_idx=env_ids,
+            gs.morphs.URDF(
+                file=cfg.urdf,
+                pos=(0.0, 0.0, 0.12),
+                fixed=False,
+                merge_fixed_links=False,
+                requires_jac_and_IK=False,
             )
-        except Exception:
-            pass
-
-        # Joint velocities (should exist)
-        self.robot.set_dofs_velocity(
-            torch.zeros((len(env_ids), 12), device=self.device),
-            self.motor_dofs,
-            envs_idx=env_ids,
         )
 
-    def _kick_base_velocity(self, env_ids: torch.Tensor):
-        """
-        Genesis 0.3.14:
-          - no set_qvel()
-          - MUST NOT touch self.robot.is_free (removed; raises DeprecationError)
-        So: try set_dofs_velocity on base DOFs (0..5). If fixed/unsupported -> ignore.
-        """
-        if not hasattr(self.robot, "set_dofs_velocity"):
-            return
+        self.cam = None
+        if with_camera:
+            self.cam = self.scene.add_camera(
+                res=(cfg.video_w, cfg.video_h),
+                pos=(0.8, -0.8, 0.45),
+                lookat=(0.0, 0.0, 0.12),
+                fov=50,
+                GUI=False,
+            )
 
-        base_vel = torch.zeros((len(env_ids), 6), device=self.device)
-        base_vel[:, 0] = (torch.rand(len(env_ids), device=self.device) * 2.0 - 1.0) * 0.5  # vx
-        base_vel[:, 5] = (torch.rand(len(env_ids), device=self.device) * 2.0 - 1.0) * 0.5  # wz
-        try:
-            self.robot.set_dofs_velocity(base_vel, self.base_dofs, envs_idx=env_ids)
-        except Exception:
-            pass
+        self.scene.build(
+            n_envs=self.n_envs,
+            env_spacing=(cfg.env_spacing, cfg.env_spacing),
+        )
+
+        name_to_joint = {j.name: j for j in self.robot.joints}
+        dof_idx = []
+        for jn in self.JOINTS_ACTUATED:
+            j = name_to_joint[jn]
+            dofs = list(j.dofs_idx_local)
+            if len(dofs) != 1:
+                raise RuntimeError(f"Expected 1 dof for {jn}, got {dofs}")
+            dof_idx.append(dofs[0])
+        self.act_dofs = torch.tensor(dof_idx, device=self.device, dtype=torch.int64)
+
+        hip_L = cfg.hip_splay
+        hip_R = -cfg.hip_splay
+        self.q0 = torch.tensor(
+            [
+                hip_L, hip_L, hip_R, hip_R,
+                cfg.thigh0, cfg.thigh0, cfg.thigh0, cfg.thigh0,
+                cfg.calf0,  cfg.calf0,  cfg.calf0,  cfg.calf0,
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        self.robot.set_dofs_kp(torch.ones(self.num_actions, device=self.device) * cfg.kp, self.act_dofs)
+        self.robot.set_dofs_kv(torch.ones(self.num_actions, device=self.device) * cfg.kv, self.act_dofs)
+
+        # obs = [z(1), quat(4), vel_body(3), ang_body(3), q_rel(12), dq(12), prev_a(12), cmd_vx(1)] = 48
+        self.obs_dim = 48
+
+        self.reset(torch.arange(self.n_envs, device=self.device, dtype=torch.int64))
+
+    def _clamp_joint_targets(self, q: torch.Tensor) -> torch.Tensor:
+        q = q.clone()
+        q[:, 0:4] = torch.clamp(q[:, 0:4], *self.JOINT_LIMITS["hip"])
+        q[:, 4:8] = torch.clamp(q[:, 4:8], *self.JOINT_LIMITS["thigh"])
+        q[:, 8:12] = torch.clamp(q[:, 8:12], *self.JOINT_LIMITS["calf"])
+        return q
+
+    def _sample_cmd(self, n: int) -> torch.Tensor:
+        lo = float(self.cfg.cmd_vx_low)
+        hi = float(self.cfg.cmd_vx_high)
+        if hi <= lo:
+            hi = lo + 1e-3
+        return lo + (hi - lo) * torch.rand(n, device=self.device)
 
     def reset(self, env_ids: torch.Tensor):
-        if env_ids.numel() == 0:
-            return
+        self.scene.reset(envs_idx=env_ids)
 
-        self.episode_length[env_ids] = 0
-        self.actuator.reset(env_ids)
+        n = int(env_ids.shape[0])
+        noise = (torch.rand(n, self.num_actions, device=self.device) - 0.5) * 0.08
+        q_init = self.q0.unsqueeze(0).repeat(n, 1) + noise
+        q_init = self._clamp_joint_targets(q_init)
 
-        # HARD reset base pose + velocities
-        self._set_base_pose(env_ids)
-        self._zero_velocities(env_ids)
+        self.robot.set_dofs_position(q_init, self.act_dofs, envs_idx=env_ids)
+        self.robot.set_dofs_velocity(torch.zeros_like(q_init), self.act_dofs, envs_idx=env_ids)
 
-        # Joint pose reset (+ noise)
-        q = self.default_dof_pos.unsqueeze(0) + (torch.rand((len(env_ids), 12), device=self.device) * 2 - 1) * 0.10
-        self.robot.set_dofs_position(q, self.motor_dofs, envs_idx=env_ids)
+        self.ep_len[env_ids] = 0
+        self.prev_action[env_ids] = 0.0
+        self.stall_steps[env_ids] = 0
+        self.cmd_vx[env_ids] = self._sample_cmd(n)
 
-        # Optional exploration kicks only after some learning
-        if self._global_update >= self.cfg.kick_after_updates:
-            self._kick_base_velocity(env_ids)
+    @torch.no_grad()
+    def get_obs(self) -> torch.Tensor:
+        pos = self.robot.get_pos()
+        quat = self.robot.get_quat()
+        vel_w = self.robot.get_vel()
+        ang_w = self.robot.get_ang()
 
-    def get_obs(self):
-        q = self.robot.get_dofs_position(self.motor_dofs)
-        dq = self.robot.get_dofs_velocity(self.motor_dofs)
+        vel_b = world_to_body_vec(quat, vel_w)
+        ang_b = world_to_body_vec(quat, ang_w)
 
-        pos = self.base_link.get_pos()
-        quat = self.base_link.get_quat()
-        v_lin = self.base_link.get_vel()
-        v_ang = self.base_link.get_ang()
+        q = self.robot.get_dofs_position(self.act_dofs)
+        dq = self.robot.get_dofs_velocity(self.act_dofs)
 
-        # body up direction proxy
-        up_world = torch.tensor([0, 0, 1], device=self.device, dtype=v_lin.dtype).expand_as(v_lin)
-        up_body = quat_rotate_wxyz(quat, up_world)
+        z = pos[:, 2:3]
+        q_rel = q - self.q0.unsqueeze(0)
 
-        # [ang_vel(3), up_body(3), lin_vel(3), height(1), q_err(12), dq(12), last_action(12)]
-        return torch.cat([v_ang, up_body, v_lin, pos[:, 2:3], q - self.default_dof_pos, dq, self.last_action], dim=-1)
+        cmd = self.cmd_vx.unsqueeze(1)
+        return torch.cat([z, quat, vel_b, ang_b, q_rel, dq, self.prev_action, cmd], dim=1)
 
-    def step(self, action: torch.Tensor, w_fwd: float):
-        self.last_action = torch.tanh(action)
-        target = self.default_dof_pos + self.cfg.action_scale * self.last_action
+    @torch.no_grad()
+    def step(self, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action = torch.clamp(action, -1.0, 1.0)
+        prev_a = self.prev_action
+        self.prev_action = action
 
-        q = self.robot.get_dofs_position(self.motor_dofs)
-        dq = self.robot.get_dofs_velocity(self.motor_dofs)
+        q_tgt = self.q0.unsqueeze(0) + self.cfg.action_scale * action
+        q_tgt = self._clamp_joint_targets(q_tgt)
 
-        torque = self.actuator.step(target, q, dq)
-        self.robot.control_dofs_force(torque, self.motor_dofs)
+        self.robot.control_dofs_position(q_tgt, self.act_dofs)
 
-        self.scene.step()
+        update_vis = bool(self.with_camera)
+        for _ in range(self.cfg.decimation):
+            self.scene.step(update_visualizer=update_vis, refresh_visualizer=update_vis)
+
+        pos = self.robot.get_pos()
+        quat = self.robot.get_quat()
+        vel_w = self.robot.get_vel()
+
+        eul = quat_to_euler_wxyz(quat)
+        roll = eul[:, 0]
+        pitch = eul[:, 1]
+
+        vel_b = world_to_body_vec(quat, vel_w)
+        v_fwd = vel_b[:, 0]
+
+        z = pos[:, 2]
+        cmd = self.cmd_vx
+
+        # ----- rewards -----
+        # (A) forward speed
+        r_fwd = self.cfg.w_fwd * torch.clamp(v_fwd, 0.0, 2.0)
+
+        # (B) track commanded speed sharply
+        err = v_fwd - cmd
+        k = 4.0
+        r_cmd = self.cfg.w_cmd * torch.exp(-k * (err / (cmd + 1e-6)) ** 2)
+
+        # (C) posture shaping
+        upright = torch.exp(-10.0 * (roll * roll + pitch * pitch))
+        r_upright = self.cfg.w_upright * upright
+
+        height = torch.exp(-80.0 * (z - self.cfg.z_target) ** 2)
+        r_height = self.cfg.w_height * height
+
+        # penalties
+        dq = self.robot.get_dofs_velocity(self.act_dofs)
+        p_energy = self.cfg.w_energy * torch.sum(dq * dq, dim=1)
+        p_action = self.cfg.w_action * torch.sum(action * action, dim=1)
+        p_smooth = self.cfg.w_smooth * torch.sum((action - prev_a) ** 2, dim=1)
+
+        # anti-stall
+        past_grace = (self.ep_len > self.cfg.stall_grace)
+        below = torch.clamp((self.cfg.vx_min - v_fwd) / (self.cfg.vx_min + 1e-6), min=0.0)
+        p_stall = self.cfg.w_stall * below * past_grace.float()
+
+        reward = (r_fwd + r_cmd + r_upright + r_height) - (p_energy + p_action + p_smooth + p_stall)
+
+        # ----- terminations -----
+        tilted = (torch.abs(roll) > self.cfg.max_tilt) | (torch.abs(pitch) > self.cfg.max_tilt)
+        fallen = z < self.cfg.min_z
+
+        self.ep_len += 1
+        time_out = self.ep_len >= self.cfg.max_ep_len
+
+        is_slow = (v_fwd < self.cfg.vx_min)
+        self.stall_steps = torch.where(past_grace & is_slow, self.stall_steps + 1, torch.zeros_like(self.stall_steps))
+
+        stalled_out = torch.zeros_like(fallen)
+        if int(self.cfg.stall_terminate) > 0:
+            stalled_out = self.stall_steps >= int(self.cfg.stall_terminate)
+
+        done = tilted | fallen | time_out | stalled_out
+        reward = reward - self.cfg.fall_penalty * (tilted | fallen).float()
+
+        if self.auto_reset:
+            done_ids = torch.nonzero(done).squeeze(-1)
+            if done_ids.numel() > 0:
+                self.reset(done_ids)
 
         obs = self.get_obs()
-        v_ang = obs[:, 0:3]
-        up_body = obs[:, 3:6]
-        v_lin = obs[:, 6:9]
-        h = obs[:, 9]
-
-        # curriculum: optionally stand first, then forward ramp
-        if self.cfg.curriculum and (self._global_update < self.cfg.stand_updates):
-            w_fwd_eff = 0.0
-        else:
-            w_fwd_eff = w_fwd
-
-        upright = up_body[:, 2].clamp(-1, 1)
-        upright_term = torch.exp(-((1.0 - upright) ** 2) / 0.1)
-
-        # NEW: explicit height term around nominal base height (0.18)height_ter
-        height_term = torch.exp(-((h - 0.18) ** 2) / 0.004)
+        return obs, reward, done
 
 
-        pose_cost = (q - self.default_dof_pos).pow(2).mean(dim=-1)
-        yaw_cost = v_ang[:, 2].abs()
-        side_cost = v_lin[:, 1].abs()
+# -----------------------------
+# Actor-Critic
+# -----------------------------
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim: int, act_dim: int, hid: int = 256):
+        super().__init__()
+        self.act_dim = act_dim
 
-        reward = (
-            self.cfg.alive_bonus
-            + (w_fwd_eff * self.cfg.fwd_scale * v_lin[:, 0])
-            + 0.5 * upright_term
-            + 0.5 * height_term
-            - (self.cfg.pose_penalty * pose_cost)
-            - (self.cfg.yaw_penalty * yaw_cost)
-            - (self.cfg.side_penalty * side_cost)
+        self.actor = nn.Sequential(
+            nn.Linear(obs_dim, hid),
+            nn.Tanh(),
+            nn.Linear(hid, hid),
+            nn.Tanh(),
+            nn.Linear(hid, act_dim),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(obs_dim, hid),
+            nn.Tanh(),
+            nn.Linear(hid, hid),
+            nn.Tanh(),
+            nn.Linear(hid, 1),
         )
 
-        # fade upright shaping over updates (optional)
-        if self.cfg.upright_decay > 0:
-            decay = math.exp(-self.cfg.upright_decay * float(self._global_update))
-            reward = reward - (1.0 - decay) * 0.5 * (1.0 - upright_term)
+        self.log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
 
-        self.episode_length += 1
-        done = (h < self.cfg.fall_h) | (self.episode_length >= self.cfg.ep_len)
+    def _dist(self, obs: torch.Tensor):
+        mu = self.actor(obs)
+        log_std = torch.clamp(self.log_std, -5.0, 2.0)
+        std = torch.exp(log_std).unsqueeze(0)
+        return torch.distributions.Normal(mu, std)
 
-        reset_ids = torch.nonzero(done).squeeze(-1)
-        self.reset(reset_ids)
+    def act(self, obs: torch.Tensor):
+        dist = self._dist(obs)
+        u = dist.rsample()
+        a = torch.tanh(u)
 
-        info = {"vfwd": v_lin[:, 0], "h": h, "upright": upright}
-        return obs, reward, done.float(), info
+        logp_u = dist.log_prob(u).sum(-1)
+        log_det = torch.sum(torch.log(1.0 - a * a + 1e-6), dim=-1)
+        logp = logp_u - log_det
 
+        v = self.critic(obs).squeeze(-1)
+        ent = dist.entropy().sum(-1)
+        return a, logp, v, ent
 
-# -----------------------------
-# PPO update (graph-safe)
-# -----------------------------
-def ppo_update(
-    model: ActorCritic,
-    opt: torch.optim.Optimizer,
-    rms: RunningMeanStd,
-    obs, act, lp0, rew, done, val, last_val,
-    cfg: CFG
-):
-    """
-    Critical rule: anything reused across PPO epochs MUST NOT carry an autograd graph.
-    So: adv/ret/obs_n/act_flat/lp0_flat are all built under no_grad + detached.
-    """
-    B, T = obs.shape[0], obs.shape[1]
+    def eval_actions(self, obs: torch.Tensor, act: torch.Tensor):
+        dist = self._dist(obs)
+        u = atanh(act)
+        logp_u = dist.log_prob(u).sum(-1)
+        log_det = torch.sum(torch.log(1.0 - act * act + 1e-6), dim=-1)
+        logp = logp_u - log_det
 
-    with torch.no_grad():
-        last_val = last_val.detach() if hasattr(last_val, "detach") else last_val
+        ent = dist.entropy().sum(-1)
+        v = self.critic(obs).squeeze(-1)
+        return logp, ent, v
 
-        adv = torch.zeros((B, T), device=obs.device)
-        ret = torch.zeros((B, T), device=obs.device)
-        gae = torch.zeros((B,), device=obs.device)
-
-        for t in reversed(range(T)):
-            mask = 1.0 - done[:, t]
-            delta = rew[:, t] + cfg.gamma * last_val * mask - val[:, t]
-            gae = delta + cfg.gamma * cfg.lam * mask * gae
-            adv[:, t] = gae
-            ret[:, t] = gae + val[:, t]
-            last_val = val[:, t]
-
-        # flatten + detach hard
-        obs_flat = obs.reshape(-1, obs.shape[-1]).detach()
-        act_flat = act.reshape(-1, act.shape[-1]).detach()
-        lp0_flat = lp0.reshape(-1).detach()
-        adv_flat = adv.reshape(-1)
-        ret_flat = ret.reshape(-1)
-
-        # normalize obs (no grad)
-        rms.update(obs_flat)
-        obs_n = rms.normalize(obs_flat)
-
-        # normalize advantages
-        adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
-
-    # PPO epochs (fresh graph each epoch through model forward only)
-    for _ in range(cfg.update_epochs):
-        mu, log_std, v = model(obs_n)
-        std = log_std.exp()
-
-        lp = (-0.5 * (((act_flat - mu) ** 2) / (std ** 2 + 1e-8)
-                      + 2.0 * log_std + math.log(2.0 * math.pi))).sum(-1)
-
-        ratio = torch.exp(lp - lp0_flat)
-        clipped = ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip)
-
-        pg_loss = -torch.min(ratio * adv_flat, clipped * adv_flat).mean()
-        vf_loss = F.mse_loss(v, ret_flat)
-        ent = (0.5 + 0.5 * math.log(2.0 * math.pi) + log_std).sum(dim=-1).mean()
-
-        loss = pg_loss + cfg.vf_coef * vf_loss - cfg.ent_coef * ent
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+    def act_deterministic(self, obs: torch.Tensor):
+        return torch.tanh(self.actor(obs))
 
 
 # -----------------------------
-# Main
+# Backend selection
 # -----------------------------
-def main():
-    cfg = CFG()
-    seed_all(cfg.seed)
+def pick_backend() -> Any:
+    backend_name = os.getenv("GS_BACKEND", "vulkan").lower()
+    if backend_name == "vulkan":
+        return gs.vulkan
+    if backend_name in ("amdgpu", "amd", "hip") and hasattr(gs, "amdgpu"):
+        return gs.amdgpu
+    return gs.gpu
 
-    gs.init(backend=gs.vulkan)
-    device = torch.device("cuda")
 
-    env = BlindWalkerEnv(cfg, device)
-    env.set_update(0)
+# -----------------------------
+# Video recording (record-only subprocess)
+# -----------------------------
+@torch.no_grad()
+def record_video_from_ckpt(ckpt_path: str, out_path: str) -> int:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    cfg = CFG.from_dict(ckpt.get("cfg", {}))
+    cfg.n_envs = 1  # enforce 1 env for video
+
+    gs.init(backend=pick_backend())
+
+    env = MiniPupperBatched(cfg, with_camera=True, auto_reset=False)
+    device = gs.device
+
+    model = ActorCritic(env.obs_dim, env.num_actions).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    # FIX: Settle phase! Allow robot to touch ground gracefully before starting recording
+    print("[video] settling physics...")
+    for _ in range(40):
+        # Hold default pose (action=0)
+        env.robot.control_dofs_position(env.q0.unsqueeze(0), env.act_dofs)
+        env.scene.step(update_visualizer=False, refresh_visualizer=False)
 
     obs = env.get_obs()
-    obs_dim = obs.shape[-1]
-    act_dim = 12
 
-    model = ActorCritic(obs_dim, act_dim, cfg.hidden, cfg.log_std_init).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    rms = RunningMeanStd((obs_dim,), device)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    def store(x: torch.Tensor) -> torch.Tensor:
-        # Recommended: clone rollout tensors to avoid aliasing with sim buffers.
-        return x.detach().clone() if cfg.clone_rollout else x.detach()
+    env.cam.start_recording()
+    try:
+        for _ in range(cfg.video_steps):
+            a = model.act_deterministic(obs)
+            obs, _, done = env.step(a)
+            env.cam.render()
+            if bool(done.item()):
+                break
 
-    for upd in range(1, 1_000_000):
-        env.set_update(upd)
+        env.cam.stop_recording(save_to_filename=out_path, fps=cfg.video_fps)
+        print(f"[video] wrote {out_path}")
+        return 0
+    except Exception as e:
+        print(f"[video] record FAILED ({type(e).__name__}): {e}")
+        traceback.print_exc()
+        return 2
 
-        # forward ramp
-        w_fwd = min(1.0, upd / max(1, cfg.fwd_ramp_updates))
 
-        obs_b, act_b, lp_b, rew_b, don_b, val_b = [], [], [], [], [], []
-        info = {}
+def spawn_record_video(ckpt_path: str, out_path: str):
+    """
+    Run video capture in a subprocess so GL/EGL failures never kill training.
+    """
+    envp = os.environ.copy()
 
-        # --- rollout (NO grad) ---
-        for _ in range(cfg.rollout_T):
-            with torch.no_grad():
-                obs_in = rms.normalize(obs)
-                a, lp, v = model.act(obs_in)
+    try_list = envp.get("VIDEO_TRY_PLATFORMS", "egl,glx,osmesa").split(",")
+    try_list = [x.strip() for x in try_list if x.strip()]
 
-            next_obs, r, d, info = env.step(a, w_fwd)
+    for plat in try_list:
+        envp["VIDEO_PYOPENGL_PLATFORM"] = plat
+        if plat == "egl":
+            envp.setdefault("VIDEO_EGL_PLATFORM", "surfaceless")
 
-            obs_b.append(store(obs))
-            act_b.append(store(a))
-            lp_b.append(store(lp))
-            rew_b.append(store(r))
-            don_b.append(store(d))
-            val_b.append(store(v))
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--record-only",
+            "--ckpt",
+            str(Path(ckpt_path).resolve()),
+            "--out",
+            str(Path(out_path).resolve()),
+        ]
+        p = subprocess.run(cmd, env=envp, check=False)
+        if p.returncode == 0:
+            return
+        print(f"[video] failed with PYOPENGL_PLATFORM={plat} (rc={p.returncode}); trying next...")
 
-            obs = next_obs
+    print("[video] all backends failed (training continues).")
 
-        # bootstrap value (NO grad, detached)
+
+# -----------------------------
+# PPO training loop
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--record-only", action="store_true")
+    parser.add_argument("--ckpt", type=str, default="")
+    parser.add_argument("--out", type=str, default="rollout.mp4")
+    args = parser.parse_args()
+
+    if args.record_only:
+        rc = record_video_from_ckpt(args.ckpt, args.out)
+        raise SystemExit(rc)
+
+    cfg = CFG()
+    os.makedirs(cfg.out_dir, exist_ok=True)
+
+    gs.init(backend=pick_backend())
+
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    env = MiniPupperBatched(cfg, with_camera=False, auto_reset=True)
+    device = gs.device
+
+    model = ActorCritic(env.obs_dim, env.num_actions).to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
+
+    T = int(cfg.horizon)
+    N = int(cfg.n_envs)
+    obs_dim = int(env.obs_dim)
+    act_dim = int(env.num_actions)
+
+    obs_buf = torch.zeros(T, N, obs_dim, device=device)
+    act_buf = torch.zeros(T, N, act_dim, device=device)
+    logp_buf = torch.zeros(T, N, device=device)
+    rew_buf = torch.zeros(T, N, device=device)
+    done_buf = torch.zeros(T, N, device=device)
+    val_buf = torch.zeros(T, N, device=device)
+
+    obs = env.get_obs()
+
+    global_steps = 0
+    t0 = time.time()
+
+    for update in range(1, cfg.total_updates + 1):
+        model.train()
+
         with torch.no_grad():
-            last_val = model(rms.normalize(obs))[2].detach()
+            for t in range(T):
+                a, logp, v, _ = model.act(obs)
 
-        ppo_update(
-            model, opt, rms,
-            torch.stack(obs_b, 1),
-            torch.stack(act_b, 1),
-            torch.stack(lp_b, 1),
-            torch.stack(rew_b, 1),
-            torch.stack(don_b, 1),
-            torch.stack(val_b, 1),
-            last_val,
-            cfg
+                obs_buf[t].copy_(obs)
+                act_buf[t].copy_(a)
+                logp_buf[t].copy_(logp)
+                val_buf[t].copy_(v)
+
+                obs, r, d = env.step(a)
+                rew_buf[t].copy_(r)
+                done_buf[t].copy_(d.float())
+
+                global_steps += N
+
+            v_last = model.critic(obs).squeeze(-1)
+
+        adv = torch.zeros(T, N, device=device)
+        last_gae = torch.zeros(N, device=device)
+
+        for t in reversed(range(T)):
+            nonterminal = 1.0 - done_buf[t]
+            next_val = v_last if t == T - 1 else val_buf[t + 1]
+            delta = rew_buf[t] + cfg.gamma * next_val * nonterminal - val_buf[t]
+            last_gae = delta + cfg.gamma * cfg.lam * nonterminal * last_gae
+            adv[t] = last_gae
+
+        ret = adv + val_buf
+
+        b_obs = obs_buf.reshape(T * N, obs_dim)
+        b_act = act_buf.reshape(T * N, act_dim)
+        b_logp = logp_buf.reshape(T * N)
+        b_adv = adv.reshape(T * N)
+        b_ret = ret.reshape(T * N)
+        b_val = val_buf.reshape(T * N)
+
+        b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
+
+        batch_size = T * N
+        idx = torch.randperm(batch_size, device=device)
+
+        for _epoch in range(cfg.ppo_epochs):
+            for start in range(0, batch_size, cfg.minibatch_size):
+                mb = idx[start:start + cfg.minibatch_size]
+                mb_obs = b_obs[mb]
+                mb_act = b_act[mb]
+                mb_old_logp = b_logp[mb]
+                mb_adv = b_adv[mb]
+                mb_ret = b_ret[mb]
+                mb_old_val = b_val[mb]
+
+                new_logp, ent, v = model.eval_actions(mb_obs, mb_act)
+
+                ratio = torch.exp(new_logp - mb_old_logp)
+                pg1 = -mb_adv * ratio
+                pg2 = -mb_adv * torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip)
+                pg_loss = torch.max(pg1, pg2).mean()
+
+                v_clipped = mb_old_val + torch.clamp(v - mb_old_val, -cfg.clip, cfg.clip)
+                vf1 = (v - mb_ret) ** 2
+                vf2 = (v_clipped - mb_ret) ** 2
+                vf_loss = 0.5 * torch.max(vf1, vf2).mean()
+
+                ent_loss = ent.mean()
+                loss = pg_loss + cfg.vf_coef * vf_loss - cfg.ent_coef * ent_loss
+
+                optim.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optim.step()
+
+        dt_s = max(1e-6, time.time() - t0)
+        env_fps = global_steps / dt_s
+        mean_rew = rew_buf.mean().item()
+
+        # live metrics
+        quat = env.robot.get_quat()
+        vel_w = env.robot.get_vel()
+        v_fwd = world_to_body_vec(quat, vel_w)[:, 0]
+        mean_vfwd = v_fwd.mean().item()
+        mean_cmd = env.cmd_vx.mean().item()
+        mean_err = (v_fwd - env.cmd_vx).abs().mean().item()
+        stall_frac = (v_fwd < cfg.vx_min).float().mean().item()
+        mean_z = env.robot.get_pos()[:, 2].mean().item()
+
+        print(
+            f"upd={update:05d}  env_fps={env_fps:10.0f}  "
+            f"mean_rew={mean_rew:+.3f}  vfwd={mean_vfwd:+.3f}  cmd={mean_cmd:+.3f}  |err|={mean_err:+.3f}  "
+            f"stall={stall_frac*100:5.1f}%  z={mean_z:+.3f}"
         )
 
-        if upd % 10 == 0:
-            mean_rew = torch.stack(rew_b, 0).mean().item()
-            mean_fwd = info["vfwd"].mean().item() if "vfwd" in info else float("nan")
-            mean_h = info["h"].mean().item() if "h" in info else float("nan")
-            mean_up = info["upright"].mean().item() if "upright" in info else float("nan")
-            print(
-                f"Upd {upd:06d} | Rew {mean_rew:+.3f} | Fwd {mean_fwd:+.3f} | h {mean_h:.3f} | up {mean_up:+.3f} "
-                f"| envs={cfg.envs} dt={cfg.dt} spacing={cfg.env_spacing} kick_after={cfg.kick_after_updates}"
-            )
+        if (update % cfg.save_every) == 0:
+            ckpt = {"update": update, "cfg": cfg.__dict__, "model": model.state_dict(), "optim": optim.state_dict()}
+            ckpt_path = os.path.join(cfg.out_dir, f"ckpt_{update:05d}.pt")
+            torch.save(ckpt, ckpt_path)
+            print(f"💾 saved {ckpt_path}")
+
+        if cfg.record_video and (update % cfg.video_every) == 0:
+            ckpt_path = os.path.join(cfg.out_dir, f"ckpt_{update:05d}.pt")
+            vid_path = os.path.join(cfg.out_dir, f"video_{update:05d}.mp4")
+
+            if not os.path.exists(ckpt_path):
+                ckpt = {"update": update, "cfg": cfg.__dict__, "model": model.state_dict(), "optim": optim.state_dict()}
+                torch.save(ckpt, ckpt_path)
+
+            spawn_record_video(ckpt_path, vid_path)
 
 
 if __name__ == "__main__":

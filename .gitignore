@@ -1,0 +1,3 @@
+*.pt
+*venv
+sim/__pycache__/

@@ -7,10 +7,10 @@ train_omni_actuator_debug.py
 Merges the successful robust physics/actuator/PPO pipeline of the forward-walking script
 with the omnidirectional velocity command tracking of the System-1 controller.
 
-Fixes: 
-- Actuator command queue is now properly initialized to the standing pose instead of zeros, 
-  preventing instant leg-folding and death-on-spawn.
-- last_action is properly cleared on reset.
+Fixes applied: 
+- Actuator command queue initialized to standing pose instead of zeros to prevent death-on-spawn.
+- Tracking rewards mapped to a curriculum ramp so the agent learns to stand before it learns to run.
+- last_action correctly cleared on reset.
 """
 
 import os
@@ -103,11 +103,9 @@ class STS3215_Actuator:
         return torch.clamp(torque, -torque_limit, torque_limit)
 
     def reset(self, env_ids: torch.Tensor | None, default_pos: torch.Tensor):
-        """
-        FIXED: Initialize queue to the standing pose, NOT zeros.
-        """
+        # FIX: Fill the queue with the standing pose instead of zeros
         if env_ids is None:
-            self.command_queue[:] = default_pos.view(1, 12, 1).expand(self.num_envs, 12, self.history_len)
+            self.command_queue[:] = default_pos.view(1, 12, 1).expand_as(self.command_queue)
         else:
             self.command_queue[env_ids] = default_pos.view(1, 12, 1).expand(len(env_ids), 12, self.history_len)
 
@@ -207,13 +205,14 @@ class CFG:
     cmd_mode: str = _env_str("CMD_MODE", "random")
     cmd_hold_steps: int = _env_int("CMD_HOLD_STEPS", 200)
 
-    # --- REWARDS ---
+    # --- REWARDS & CURRICULUM ---
     curriculum: bool = _env_bool("CURRICULUM", "1")
     stand_updates: int = _env_int("STAND_UPDATES", 0)
+    ramp_updates: int = _env_int("FWD_RAMP_UPDATES", 400)
     upright_decay: float = _env_float("UPRIGHT_DECAY", 0.3)
     
-    w_track_lin: float = _env_float("W_TRACK_LIN", 10.0)
-    w_track_ang: float = _env_float("W_TRACK_ANG", 5.0)
+    w_track_lin: float = _env_float("W_TRACK_LIN", 3.0)
+    w_track_ang: float = _env_float("W_TRACK_ANG", 1.5)
     tracking_sigma_lin: float = _env_float("TRACKING_SIGMA_LIN", 0.25)
     tracking_sigma_ang: float = _env_float("TRACKING_SIGMA_ANG", 0.25)
 
@@ -443,7 +442,7 @@ class BlindWalkerOmniEnv:
         self.stall_counters[env_ids] = 0
         self.cmd_timers[env_ids] = 0
         
-        # FIXED: Explicitly zero out the previous action
+        # FIX: Explicitly zero out previous network action memory
         self.last_action[env_ids] = 0.0
 
         if self.cfg.cmd_mode.lower() != "external":
@@ -455,7 +454,7 @@ class BlindWalkerOmniEnv:
         q = self.default_dof_pos.unsqueeze(0) + (torch.rand((len(env_ids), 12), device=self.device) * 2 - 1) * 0.10
         self.robot.set_dofs_position(q, self.motor_dofs, envs_idx=env_ids)
         
-        # FIXED: Initialize command queue to the standing pose to prevent massive initial torques
+        # FIX: Ensure actuator queue wakes up believing it is standing still, avoiding violent kicks
         self.actuator.reset(env_ids, self.default_dof_pos)
 
         if self._global_update >= self.cfg.kick_after_updates:
@@ -481,7 +480,7 @@ class BlindWalkerOmniEnv:
         # Dimension: v_ang(3) + up_body(3) + v_lin(3) + h(1) + q_err(12) + dq(12) + last_act(12) + cmd(3) = 49
         return torch.cat([v_ang, up_body, v_lin, pos[:, 2:3], q - self.default_dof_pos, dq, self.last_action, cmd_obs], dim=-1)
 
-    def step(self, action: torch.Tensor):
+    def step(self, action: torch.Tensor, w_track: float):
         self.last_action = torch.tanh(action)
         target = self.default_dof_pos + self.cfg.action_scale * self.last_action
 
@@ -523,10 +522,8 @@ class BlindWalkerOmniEnv:
         sigma_ang_sq = self.cfg.tracking_sigma_ang ** 2
         r_track_ang = self.cfg.w_track_ang * torch.exp(-ang_err_sq / (2.0 * max(1e-8, sigma_ang_sq)))
 
-        # Zero tracking if in stand curriculum
-        if self.cfg.curriculum and (self._global_update < self.cfg.stand_updates):
-            r_track_lin = torch.zeros_like(r_track_lin)
-            r_track_ang = torch.zeros_like(r_track_ang)
+        # FIX: Apply Curriculum scaling to tracking targets
+        w_track_eff = 0.0 if (self.cfg.curriculum and self._global_update < self.cfg.stand_updates) else w_track
 
         upright = up_body[:, 2].clamp(-1, 1)
         upright_term = torch.exp(-((1.0 - upright) ** 2) / 0.1)
@@ -536,8 +533,8 @@ class BlindWalkerOmniEnv:
 
         reward = (
             self.cfg.alive_bonus
-            + r_track_lin
-            + r_track_ang
+            + (w_track_eff * r_track_lin)
+            + (w_track_eff * r_track_ang)
             + 0.5 * upright_term
             + 0.5 * height_term
             - (self.cfg.pose_penalty * pose_cost)
@@ -559,13 +556,16 @@ class BlindWalkerOmniEnv:
         fallen = h < self.cfg.fall_h
         time_out = self.episode_length >= self.cfg.ep_len
 
-        # Stall Logic
+        # Stall Logic (disabled if currently ramping curriculum to prevent false-positives)
         v_norm = torch.norm(v_xy, dim=1)
         cmd_norm = torch.norm(cmd_xy, dim=1).clamp_min(1e-6)
         cmd_active = cmd_norm > float(self.cfg.stall_cmd_thresh)
-
         vel_low_rel = v_norm < (float(self.cfg.stall_frac) * cmd_norm)
-        stall_candidate = cmd_active & vel_low_rel & (self.episode_length > int(self.cfg.stall_grace_steps))
+        
+        if w_track_eff < 0.99:
+            stall_candidate = torch.zeros_like(cmd_active)
+        else:
+            stall_candidate = cmd_active & vel_low_rel & (self.episode_length > int(self.cfg.stall_grace_steps))
 
         self.stall_counters = torch.where(stall_candidate, self.stall_counters + 1, torch.zeros_like(self.stall_counters))
         stalled_out = self.stall_counters > int(self.cfg.stall_timeout_steps)
@@ -704,7 +704,8 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str, device: torch.device) 
 
             obs = env.get_obs()
             a, _, _ = model.act(rms.normalize(obs), deterministic=True)
-            _, _, done, _ = env.step(a)
+            # w_track=1.0 explicitly tells it we want it to move in evaluation
+            _, _, done, _ = env.step(a, 1.0)
 
             base_pos = env.base_link.get_pos()[0]
             cam_offset = torch.tensor([1.2, -1.2, 0.6], device=device)
@@ -802,6 +803,9 @@ def main():
 
     for upd in range(1, cfg.total_updates + 1):
         env.set_update(upd)
+        
+        # Calculate Curriculum track weight
+        w_track = min(1.0, upd / max(1, cfg.ramp_updates))
 
         obs_b, act_b, lp_b, rew_b, don_b, val_b = [], [], [], [], [], []
         info_dict = {
@@ -814,7 +818,7 @@ def main():
                 obs_in = rms.normalize(obs)
                 a, lp, v = model.act(obs_in)
 
-            next_obs, r, d, info = env.step(a)
+            next_obs, r, d, info = env.step(a, w_track)
 
             obs_b.append(store(obs))
             act_b.append(store(a))

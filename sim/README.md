@@ -5,12 +5,12 @@ We are using **Genesis** because Isaac Lab locks us into CUDA. Genesis supports 
 ## The Reality Gap
 Simulations usually fail because they assume motors are magic. Real motors suck. They have latency, friction, and they get weaker as the battery dies.
 
-This folder contains the `STS3215_Actuator` Python class. This is the most important file in the repo. It injects:
+This folder contains the `STS3215_Actuator` Python class. It injects:
 * **Latency:** A 20ms delay buffer to mimic UART comms.
 * **Voltage Sag:** Torque drops as the simulated LiPo voltage drops.
 * **Torque-Speed Curve:** Physics limits based on back-EMF.
 
-**Do not turn these off.** If you train on perfect motors, the real robot will shake itself to death.
+**Do not turn these off.** If you train on perfect motors, the real robot may struggle.
 
 ## Workflow
 

@@ -2,15 +2,11 @@
 from __future__ import annotations
 
 """
-train_omni_actuator_debug.py
+train_omni_actuator_robust.py
 
-Merges the successful robust physics/actuator/PPO pipeline of the forward-walking script
-with the omnidirectional velocity command tracking of the System-1 controller.
-
-Fixes applied: 
-- Actuator command queue initialized to standing pose instead of zeros to prevent death-on-spawn.
-- Tracking rewards mapped to a curriculum ramp so the agent learns to stand before it learns to run.
-- last_action correctly cleared on reset.
+Fixes:
+- World vs Body frame kinematics fixed: v_lin and v_ang are now correctly transformed to Body frame.
+- Posture Gating: Tracking rewards are strictly gated by upright & height terms to prevent the belly-shuffle exploit.
 """
 
 import os
@@ -103,7 +99,6 @@ class STS3215_Actuator:
         return torch.clamp(torque, -torque_limit, torque_limit)
 
     def reset(self, env_ids: torch.Tensor | None, default_pos: torch.Tensor):
-        # FIX: Fill the queue with the standing pose instead of zeros
         if env_ids is None:
             self.command_queue[:] = default_pos.view(1, 12, 1).expand_as(self.command_queue)
         else:
@@ -113,10 +108,25 @@ class STS3215_Actuator:
 # -----------------------------
 # Math Helpers
 # -----------------------------
-def quat_rotate_wxyz(q, v):
-    q_w, q_vec = q[..., 0:1], q[..., 1:4]
-    t = 2.0 * torch.cross(q_vec, v, dim=-1)
-    return v + q_w * t + torch.cross(q_vec, t, dim=-1)
+def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
+    return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
+
+def quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    w = aw * bw - ax * bx - ay * by - az * bz
+    x = aw * bx + ax * bw + ay * bz - az * by
+    y = aw * by - ax * bz + ay * bw + az * bx
+    z = aw * bz + ax * by - ay * bx + az * bw
+    return torch.stack([w, x, y, z], dim=-1)
+
+def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros((v.shape[0], 1), device=v.device, dtype=v.dtype)
+    vq = torch.cat([zeros, v], dim=-1)
+    return quat_mul_wxyz(quat_mul_wxyz(q, vq), quat_conj_wxyz(q))[:, 1:4]
+
+def world_to_body_vec(quat_wxyz: torch.Tensor, vec_world: torch.Tensor) -> torch.Tensor:
+    return quat_rotate_wxyz(quat_conj_wxyz(quat_wxyz), vec_world)
 
 def quat_to_euler_wxyz(q: torch.Tensor) -> torch.Tensor:
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
@@ -197,7 +207,7 @@ class CFG:
     action_scale: float = _env_float("ACTION_SCALE", 0.65)
     force_limit: float = _env_float("FORCE_LIMIT", 30.0)
 
-    # --- COMMAND INTERFACE (Phase 1 Curriculum) ---
+    # --- COMMAND INTERFACE ---
     cmd_vx_range: Tuple[float, float] = _env_tuple2("CMD_VX_RANGE", (0.2, 0.6))
     cmd_vy_range: Tuple[float, float] = _env_tuple2("CMD_VY_RANGE", (-0.05, 0.05))
     cmd_wz_range: Tuple[float, float] = _env_tuple2("CMD_WZ_RANGE", (-0.2, 0.2))
@@ -211,8 +221,8 @@ class CFG:
     ramp_updates: int = _env_int("FWD_RAMP_UPDATES", 400)
     upright_decay: float = _env_float("UPRIGHT_DECAY", 0.3)
     
-    w_track_lin: float = _env_float("W_TRACK_LIN", 3.0)
-    w_track_ang: float = _env_float("W_TRACK_ANG", 1.5)
+    w_track_lin: float = _env_float("W_TRACK_LIN", 5.0)
+    w_track_ang: float = _env_float("W_TRACK_ANG", 2.5)
     tracking_sigma_lin: float = _env_float("TRACKING_SIGMA_LIN", 0.25)
     tracking_sigma_ang: float = _env_float("TRACKING_SIGMA_ANG", 0.25)
 
@@ -341,7 +351,6 @@ class BlindWalkerOmniEnv:
         self.vy_max = max(abs(cfg.cmd_vy_range[0]), abs(cfg.cmd_vy_range[1]))
         self.wz_max = max(abs(cfg.cmd_wz_range[0]), abs(cfg.cmd_wz_range[1]))
 
-        # Termination Tracking Metrics
         self._term_counts = torch.zeros(4, device=device, dtype=torch.int64)
         self._term_total = torch.zeros(1, device=device, dtype=torch.int64)
 
@@ -442,7 +451,6 @@ class BlindWalkerOmniEnv:
         self.stall_counters[env_ids] = 0
         self.cmd_timers[env_ids] = 0
         
-        # FIX: Explicitly zero out previous network action memory
         self.last_action[env_ids] = 0.0
 
         if self.cfg.cmd_mode.lower() != "external":
@@ -454,7 +462,6 @@ class BlindWalkerOmniEnv:
         q = self.default_dof_pos.unsqueeze(0) + (torch.rand((len(env_ids), 12), device=self.device) * 2 - 1) * 0.10
         self.robot.set_dofs_position(q, self.motor_dofs, envs_idx=env_ids)
         
-        # FIX: Ensure actuator queue wakes up believing it is standing still, avoiding violent kicks
         self.actuator.reset(env_ids, self.default_dof_pos)
 
         if self._global_update >= self.cfg.kick_after_updates:
@@ -466,10 +473,16 @@ class BlindWalkerOmniEnv:
 
         pos = self.base_link.get_pos()
         quat = self.base_link.get_quat()
-        v_lin = self.base_link.get_vel()
-        v_ang = self.base_link.get_ang()
+        
+        # World frame velocities
+        v_lin_w = self.base_link.get_vel()
+        v_ang_w = self.base_link.get_ang()
 
-        up_world = torch.tensor([0, 0, 1], device=self.device, dtype=v_lin.dtype).expand_as(v_lin)
+        # Body frame velocities (CRITICAL FIX FOR OMNI)
+        v_lin_b = world_to_body_vec(quat, v_lin_w)
+        v_ang_b = world_to_body_vec(quat, v_ang_w)
+
+        up_world = torch.tensor([0, 0, 1], device=self.device, dtype=v_lin_w.dtype).expand_as(v_lin_w)
         up_body = quat_rotate_wxyz(quat, up_world)
 
         cmd_obs = self.commands.clone()
@@ -477,8 +490,8 @@ class BlindWalkerOmniEnv:
         cmd_obs[:, 1] /= max(1e-6, self.vy_max)
         cmd_obs[:, 2] /= max(1e-6, self.wz_max)
 
-        # Dimension: v_ang(3) + up_body(3) + v_lin(3) + h(1) + q_err(12) + dq(12) + last_act(12) + cmd(3) = 49
-        return torch.cat([v_ang, up_body, v_lin, pos[:, 2:3], q - self.default_dof_pos, dq, self.last_action, cmd_obs], dim=-1)
+        # Output shape: 49
+        return torch.cat([v_ang_b, up_body, v_lin_b, pos[:, 2:3], q - self.default_dof_pos, dq, self.last_action, cmd_obs], dim=-1)
 
     def step(self, action: torch.Tensor, w_track: float):
         self.last_action = torch.tanh(action)
@@ -502,16 +515,16 @@ class BlindWalkerOmniEnv:
         self.scene.step(update_visualizer=update_vis, refresh_visualizer=update_vis)
 
         obs = self.get_obs()
-        v_ang = obs[:, 0:3]
+        v_ang_b = obs[:, 0:3]
         up_body = obs[:, 3:6]
-        v_lin = obs[:, 6:9]
+        v_lin_b = obs[:, 6:9]
         h = obs[:, 9]
 
         cmd_xy = self.commands[:, :2]
         cmd_wz = self.commands[:, 2]
 
-        v_xy = v_lin[:, :2]
-        w_z = v_ang[:, 2]
+        v_xy = v_lin_b[:, :2]
+        w_z = v_ang_b[:, 2]
 
         # Tracking Rewards
         lin_err_sq = torch.sum((v_xy - cmd_xy) ** 2, dim=1)
@@ -522,12 +535,18 @@ class BlindWalkerOmniEnv:
         sigma_ang_sq = self.cfg.tracking_sigma_ang ** 2
         r_track_ang = self.cfg.w_track_ang * torch.exp(-ang_err_sq / (2.0 * max(1e-8, sigma_ang_sq)))
 
-        # FIX: Apply Curriculum scaling to tracking targets
         w_track_eff = 0.0 if (self.cfg.curriculum and self._global_update < self.cfg.stand_updates) else w_track
 
         upright = up_body[:, 2].clamp(-1, 1)
         upright_term = torch.exp(-((1.0 - upright) ** 2) / 0.1)
         height_term = torch.exp(-((h - 0.18) ** 2) / 0.004)
+
+        # POSTURE GATE (CRITICAL FIX): Eliminates the "Belly Shuffle" exploit.
+        # Zeroes out tracking reward if the robot falls down.
+        tracking_gate = (upright_term * height_term).detach()
+
+        r_track_lin = r_track_lin * tracking_gate
+        r_track_ang = r_track_ang * tracking_gate
 
         pose_cost = (q - self.default_dof_pos).pow(2).mean(dim=-1)
 
@@ -556,7 +575,7 @@ class BlindWalkerOmniEnv:
         fallen = h < self.cfg.fall_h
         time_out = self.episode_length >= self.cfg.ep_len
 
-        # Stall Logic (disabled if currently ramping curriculum to prevent false-positives)
+        # Stall Logic (disabled if curriculum is actively scaling up)
         v_norm = torch.norm(v_xy, dim=1)
         cmd_norm = torch.norm(cmd_xy, dim=1).clamp_min(1e-6)
         cmd_active = cmd_norm > float(self.cfg.stall_cmd_thresh)
@@ -704,7 +723,6 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str, device: torch.device) 
 
             obs = env.get_obs()
             a, _, _ = model.act(rms.normalize(obs), deterministic=True)
-            # w_track=1.0 explicitly tells it we want it to move in evaluation
             _, _, done, _ = env.step(a, 1.0)
 
             base_pos = env.base_link.get_pos()[0]

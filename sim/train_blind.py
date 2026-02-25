@@ -1,52 +1,32 @@
 #!/usr/bin/env python3
-"""
-PROJECT CERBERUS: PPO BLIND WALKER (Genesis 0.3.14 | gs.vulkan)
-
-FULL REGEN (stable):
-
-Fixes baked in:
-1) Scene.build(): env_spacing MUST be a tuple (x, y)               -> ENV_SPACING="2.5,2.5"
-2) RigidEntity has NO set_qvel() in 0.3.14                         -> use set_dofs_velocity() on base DOFs (0..5)
-3) RigidEntity.is_free property is REMOVED and raises DeprecationError
-   -> never access is_free; just try/except base kick
-4) PPO autograd bug ("backward through graph a second time")
-   -> rollout/GAE/returns are STRICTLY no-grad + detached (+ clones)
-5) BIG PRACTICAL FIX: reset now hard-resets BASE pose/orientation and velocities
-   -> prevents learning from being stuck inverted on the floor
-6) Reward includes a height term centered at nominal base height
-
-Your command works as-is:
-  ENV_SPACING="2.5,2.5" CURRICULUM=1 STAND_UPDATES=0 FWD_RAMP_UPDATES=400 UPRIGHT_DECAY=0.3 \
-  ACTION_SCALE=0.65 POSE_PENALTY=1e-4 ALIVE_BONUS=0.0 FWD_SCALE=3.0 ENT_COEF=0.02 \
-  YAW_PENALTY=0.1 SIDE_PENALTY=0.1 python3 sim/train_blind.py
-
-Useful knobs:
-  ENVS=1024
-  DT=0.01
-  FORCE_LIMIT=30
-  ROLLOUT_T=256
-  UPDATE_EPOCHS=4
-  HIDDEN=256
-  LR=3e-4
-  KICK_AFTER_UPDATES=500    (disable kicks early; helps learn standing)
-  CLONE_ROLLOUT=1           (recommended; avoids any sim-buffer aliasing)
-  FALL_H=0.10               (termination height)
-  EP_LEN=800
-  SEED=0
-  URDF=./assets/mini_pupper/mini_pupper.urdf
-"""
-
 from __future__ import annotations
 
+"""
+train_omni_actuator_survival.py
+
+Merges the successful robust physics/actuator/PPO pipeline of the forward-walking script
+with the omnidirectional velocity command tracking of the System-1 controller.
+"""
+
 import os
+import sys
 import math
 import random
+import argparse
+import subprocess
+import traceback
 from dataclasses import dataclass
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, Dict, Any, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Video Backend Setup (headless-safe)
+if "--record-only" in sys.argv:
+    os.environ.setdefault("PYOPENGL_PLATFORM", os.getenv("VIDEO_PYOPENGL_PLATFORM", "egl"))
+    os.environ.setdefault("EGL_PLATFORM", os.getenv("VIDEO_EGL_PLATFORM", "surfaceless"))
 
 import genesis as gs
 
@@ -57,18 +37,14 @@ import genesis as gs
 def _env_int(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)).strip())
 
-
 def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)).strip())
-
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
-
 def _env_str(name: str, default: str) -> str:
     return os.getenv(name, default).strip()
-
 
 def _env_tuple2(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
     raw = os.getenv(name, "").strip()
@@ -82,6 +58,9 @@ def _env_tuple2(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
     s = float(raw)
     return (s, s)
 
+def now_tag() -> str:
+    import time
+    return time.strftime("%Y%m%d_%H%M%S")
 
 def seed_all(seed: int) -> None:
     random.seed(seed)
@@ -126,20 +105,16 @@ class STS3215_Actuator:
 
 
 # -----------------------------
-# Quaternion helper (wxyz)
+# Math Helpers
 # -----------------------------
 def quat_rotate_wxyz(q, v):
-    """
-    Rotate vector v by quaternion q (wxyz).
-    q: (...,4), v: (...,3)
-    """
     q_w, q_vec = q[..., 0:1], q[..., 1:4]
     t = 2.0 * torch.cross(q_vec, v, dim=-1)
     return v + q_w * t + torch.cross(q_vec, t, dim=-1)
 
 
 # -----------------------------
-# PPO network
+# PPO network & Normalizer
 # -----------------------------
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int, act_dim: int, hidden: int, log_std_init: float):
@@ -206,17 +181,27 @@ class CFG:
     action_scale: float = _env_float("ACTION_SCALE", 0.65)
     force_limit: float = _env_float("FORCE_LIMIT", 30.0)
 
+    # --- COMMAND INTERFACE (Phase 1 Curriculum) ---
+    cmd_vx_range: Tuple[float, float] = _env_tuple2("CMD_VX_RANGE", (0.2, 0.6))
+    cmd_vy_range: Tuple[float, float] = _env_tuple2("CMD_VY_RANGE", (-0.05, 0.05))
+    cmd_wz_range: Tuple[float, float] = _env_tuple2("CMD_WZ_RANGE", (-0.2, 0.2))
+
+    cmd_mode: str = _env_str("CMD_MODE", "random")
+    cmd_hold_steps: int = _env_int("CMD_HOLD_STEPS", 200)
+
     # shaping / curriculum
-    curriculum: bool = _env_bool("CURRICULUM", "0")
+    curriculum: bool = _env_bool("CURRICULUM", "1")
     stand_updates: int = _env_int("STAND_UPDATES", 0)
-    fwd_scale: float = _env_float("FWD_SCALE", 3.0)
-    fwd_ramp_updates: int = _env_int("FWD_RAMP_UPDATES", 400)
     upright_decay: float = _env_float("UPRIGHT_DECAY", 0.3)
+    
+    # Tracking Rewards
+    w_track_lin: float = _env_float("W_TRACK_LIN", 10.0)
+    w_track_ang: float = _env_float("W_TRACK_ANG", 5.0)
+    tracking_sigma_lin: float = _env_float("TRACKING_SIGMA_LIN", 0.25)
+    tracking_sigma_ang: float = _env_float("TRACKING_SIGMA_ANG", 0.25)
 
     pose_penalty: float = _env_float("POSE_PENALTY", 1e-4)
     alive_bonus: float = _env_float("ALIVE_BONUS", 0.0)
-    yaw_penalty: float = _env_float("YAW_PENALTY", 0.1)
-    side_penalty: float = _env_float("SIDE_PENALTY", 0.1)
 
     # episode termination
     fall_h: float = _env_float("FALL_H", 0.10)
@@ -240,23 +225,48 @@ class CFG:
 
     # misc
     seed: int = _env_int("SEED", 0)
-
-    # paths
     urdf: str = _env_str("URDF", "./assets/mini_pupper/mini_pupper.urdf")
+
+    # Video output
+    out_dir: str = _env_str("OUT_DIR", f"runs/sys1_omni_{now_tag()}")
+    save_every: int = _env_int("SAVE_EVERY", 100)
+    video_every: int = _env_int("VIDEO_EVERY", 200)
+    video_steps: int = _env_int("VIDEO_STEPS", 600)
+    video_fps: int = _env_int("VIDEO_FPS", 30)
+    video_w: int = _env_int("VIDEO_W", 640)
+    video_h: int = _env_int("VIDEO_H", 480)
+    record_video: bool = _env_bool("RECORD_VIDEO", "1")
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "CFG":
+        c = CFG()
+        for k, v in d.items():
+            if hasattr(c, k):
+                setattr(c, k, v)
+        return c
 
 
 # -----------------------------
 # Genesis Env
 # -----------------------------
-class BlindWalkerEnv:
-    def __init__(self, cfg: CFG, device: torch.device):
+class BlindWalkerOmniEnv:
+    def __init__(self, cfg: CFG, device: torch.device, with_camera: bool = False):
         self.cfg = cfg
         self.device = device
         self._global_update = 0
+        self.with_camera = with_camera
 
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=cfg.dt, substeps=2),
+            show_viewer=False,
+            vis_options=gs.options.VisOptions(
+                plane_reflection=False,
+                show_world_frame=False,
+                show_link_frame=False,
+                show_cameras=False,
+            ),
             rigid_options=gs.options.RigidOptions(gravity=(0, 0, -9.81)),
+            renderer=gs.renderers.Rasterizer() if with_camera else None,
         )
         self.scene.add_entity(gs.morphs.Plane())
 
@@ -265,14 +275,21 @@ class BlindWalkerEnv:
             material=gs.materials.Rigid(),
         )
 
-        # FIX: env_spacing must be tuple(len=2)
+        self.cam = None
+        if with_camera:
+            self.cam = self.scene.add_camera(
+                res=(cfg.video_w, cfg.video_h),
+                pos=(0.8, -0.8, 0.45),
+                lookat=(0.0, 0.0, 0.12),
+                fov=50,
+                GUI=False,
+            )
+
         self.scene.build(n_envs=cfg.envs, env_spacing=cfg.env_spacing)
 
-        # DOFs: base (0..5) + motors (6..17) for this URDF in Genesis
         self.base_dofs = torch.arange(0, 6, device=device)
         self.motor_dofs = torch.arange(6, 18, device=device)
 
-        # Gains for 12 motors
         self.robot.set_dofs_kp(torch.zeros(12, device=device), self.motor_dofs)
         self.robot.set_dofs_kv(torch.zeros(12, device=device), self.motor_dofs)
 
@@ -281,27 +298,55 @@ class BlindWalkerEnv:
 
         self.base_link = self.robot.get_link("base_link")
 
-        # Nominal base pose
         self.base_pos0 = torch.tensor([0.0, 0.0, 0.18], device=device)
-        self.base_quat0 = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)  # wxyz
+        self.base_quat0 = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device) 
 
-        # Nominal joint pose (may still exceed limits in URDF -> warning is ok)
         self.default_dof_pos = torch.tensor([0.0, 0.6, -1.2] * 4, device=device)
 
         self.actuator = STS3215_Actuator(cfg.envs, device, dt=cfg.dt)
         self.last_action = torch.zeros((cfg.envs, 12), device=device)
         self.episode_length = torch.zeros(cfg.envs, device=device)
 
+        self.commands = torch.zeros(cfg.envs, 3, device=device, dtype=torch.float32)
+        self.cmd_timers = torch.zeros(cfg.envs, device=device, dtype=torch.int32)
+        self.vx_max = max(abs(cfg.cmd_vx_range[0]), abs(cfg.cmd_vx_range[1]))
+        self.vy_max = max(abs(cfg.cmd_vy_range[0]), abs(cfg.cmd_vy_range[1]))
+        self.wz_max = max(abs(cfg.cmd_wz_range[0]), abs(cfg.cmd_wz_range[1]))
+
         self.reset(torch.arange(cfg.envs, device=device))
 
     def set_update(self, upd: int):
         self._global_update = upd
 
+    def _sample_cmd(self, n: int) -> torch.Tensor:
+        vx_lo, vx_hi = self.cfg.cmd_vx_range
+        vy_lo, vy_hi = self.cfg.cmd_vy_range
+        wz_lo, wz_hi = self.cfg.cmd_wz_range
+
+        cmd = torch.empty(n, 3, device=self.device, dtype=torch.float32)
+        cmd[:, 0] = torch.rand(n, device=self.device) * (vx_hi - vx_lo) + vx_lo
+        cmd[:, 1] = torch.rand(n, device=self.device) * (vy_hi - vy_lo) + vy_lo
+        cmd[:, 2] = torch.rand(n, device=self.device) * (wz_hi - wz_lo) + wz_lo
+        return cmd
+
+    @torch.no_grad()
+    def set_commands(self, cmd: torch.Tensor, env_ids: Optional[torch.Tensor] = None):
+        if cmd.ndim == 1:
+            cmd = cmd.unsqueeze(0)
+        
+        if env_ids is None:
+            if cmd.shape[0] == 1:
+                cmd = cmd.repeat(self.cfg.envs, 1)
+            self.commands[:] = cmd.to(self.device)
+        else:
+            if cmd.shape[0] == 1:
+                cmd = cmd.repeat(int(env_ids.numel()), 1)
+            self.commands[env_ids] = cmd.to(self.device)
+
     def _set_base_pose(self, env_ids: torch.Tensor):
         pos = self.base_pos0.expand(len(env_ids), 3).clone()
         quat = self.base_quat0.expand(len(env_ids), 4).clone()
 
-        # Prefer base_link if it supports set_pos/set_quat (Genesis API can vary)
         try:
             self.base_link.set_pos(pos, envs_idx=env_ids)
             self.base_link.set_quat(quat, envs_idx=env_ids)
@@ -309,7 +354,6 @@ class BlindWalkerEnv:
         except Exception:
             pass
 
-        # Fallback: entity-level set_pos/set_quat
         try:
             self.robot.set_pos(pos, envs_idx=env_ids)
             self.robot.set_quat(quat, envs_idx=env_ids)
@@ -317,7 +361,6 @@ class BlindWalkerEnv:
             pass
 
     def _zero_velocities(self, env_ids: torch.Tensor):
-        # Base velocities (best-effort)
         try:
             self.robot.set_dofs_velocity(
                 torch.zeros((len(env_ids), 6), device=self.device),
@@ -327,7 +370,6 @@ class BlindWalkerEnv:
         except Exception:
             pass
 
-        # Joint velocities (should exist)
         self.robot.set_dofs_velocity(
             torch.zeros((len(env_ids), 12), device=self.device),
             self.motor_dofs,
@@ -335,18 +377,12 @@ class BlindWalkerEnv:
         )
 
     def _kick_base_velocity(self, env_ids: torch.Tensor):
-        """
-        Genesis 0.3.14:
-          - no set_qvel()
-          - MUST NOT touch self.robot.is_free (removed; raises DeprecationError)
-        So: try set_dofs_velocity on base DOFs (0..5). If fixed/unsupported -> ignore.
-        """
         if not hasattr(self.robot, "set_dofs_velocity"):
             return
 
         base_vel = torch.zeros((len(env_ids), 6), device=self.device)
-        base_vel[:, 0] = (torch.rand(len(env_ids), device=self.device) * 2.0 - 1.0) * 0.5  # vx
-        base_vel[:, 5] = (torch.rand(len(env_ids), device=self.device) * 2.0 - 1.0) * 0.5  # wz
+        base_vel[:, 0] = (torch.rand(len(env_ids), device=self.device) * 2.0 - 1.0) * 0.5 
+        base_vel[:, 5] = (torch.rand(len(env_ids), device=self.device) * 2.0 - 1.0) * 0.5 
         try:
             self.robot.set_dofs_velocity(base_vel, self.base_dofs, envs_idx=env_ids)
         except Exception:
@@ -357,17 +393,18 @@ class BlindWalkerEnv:
             return
 
         self.episode_length[env_ids] = 0
+        self.cmd_timers[env_ids] = 0
         self.actuator.reset(env_ids)
 
-        # HARD reset base pose + velocities
+        if self.cfg.cmd_mode.lower() != "external":
+            self.commands[env_ids] = self._sample_cmd(len(env_ids))
+
         self._set_base_pose(env_ids)
         self._zero_velocities(env_ids)
 
-        # Joint pose reset (+ noise)
         q = self.default_dof_pos.unsqueeze(0) + (torch.rand((len(env_ids), 12), device=self.device) * 2 - 1) * 0.10
         self.robot.set_dofs_position(q, self.motor_dofs, envs_idx=env_ids)
 
-        # Optional exploration kicks only after some learning
         if self._global_update >= self.cfg.kick_after_updates:
             self._kick_base_velocity(env_ids)
 
@@ -380,16 +417,28 @@ class BlindWalkerEnv:
         v_lin = self.base_link.get_vel()
         v_ang = self.base_link.get_ang()
 
-        # body up direction proxy
         up_world = torch.tensor([0, 0, 1], device=self.device, dtype=v_lin.dtype).expand_as(v_lin)
         up_body = quat_rotate_wxyz(quat, up_world)
 
-        # [ang_vel(3), up_body(3), lin_vel(3), height(1), q_err(12), dq(12), last_action(12)]
-        return torch.cat([v_ang, up_body, v_lin, pos[:, 2:3], q - self.default_dof_pos, dq, self.last_action], dim=-1)
+        cmd_obs = self.commands.clone()
+        cmd_obs[:, 0] /= max(1e-6, self.vx_max)
+        cmd_obs[:, 1] /= max(1e-6, self.vy_max)
+        cmd_obs[:, 2] /= max(1e-6, self.wz_max)
 
-    def step(self, action: torch.Tensor, w_fwd: float):
+        # Dimension: v_ang(3) + up_body(3) + v_lin(3) + h(1) + q_err(12) + dq(12) + last_act(12) + cmd(3) = 49
+        return torch.cat([v_ang, up_body, v_lin, pos[:, 2:3], q - self.default_dof_pos, dq, self.last_action, cmd_obs], dim=-1)
+
+    def step(self, action: torch.Tensor):
         self.last_action = torch.tanh(action)
         target = self.default_dof_pos + self.cfg.action_scale * self.last_action
+
+        if self.cfg.cmd_mode.lower() != "external":
+            self.cmd_timers += 1
+            resample_mask = self.cmd_timers >= int(self.cfg.cmd_hold_steps)
+            if bool(resample_mask.any()):
+                ids = torch.nonzero(resample_mask).squeeze(-1)
+                self.commands[ids] = self._sample_cmd(int(ids.numel()))
+                self.cmd_timers[ids] = 0
 
         q = self.robot.get_dofs_position(self.motor_dofs)
         dq = self.robot.get_dofs_velocity(self.motor_dofs)
@@ -397,7 +446,8 @@ class BlindWalkerEnv:
         torque = self.actuator.step(target, q, dq)
         self.robot.control_dofs_force(torque, self.motor_dofs)
 
-        self.scene.step()
+        update_vis = bool(self.with_camera)
+        self.scene.step(update_visualizer=update_vis, refresh_visualizer=update_vis)
 
         obs = self.get_obs()
         v_ang = obs[:, 0:3]
@@ -405,34 +455,41 @@ class BlindWalkerEnv:
         v_lin = obs[:, 6:9]
         h = obs[:, 9]
 
-        # curriculum: optionally stand first, then forward ramp
+        cmd_xy = self.commands[:, :2]
+        cmd_wz = self.commands[:, 2]
+
+        v_xy = v_lin[:, :2]
+        w_z = v_ang[:, 2]
+
+        # Tracking Rewards
+        lin_err_sq = torch.sum((v_xy - cmd_xy) ** 2, dim=1)
+        sigma_lin_sq = self.cfg.tracking_sigma_lin ** 2
+        r_track_lin = self.cfg.w_track_lin * torch.exp(-lin_err_sq / (2.0 * max(1e-8, sigma_lin_sq)))
+
+        ang_err_sq = (w_z - cmd_wz) ** 2
+        sigma_ang_sq = self.cfg.tracking_sigma_ang ** 2
+        r_track_ang = self.cfg.w_track_ang * torch.exp(-ang_err_sq / (2.0 * max(1e-8, sigma_ang_sq)))
+
+        # Zero tracking if in stand curriculum
         if self.cfg.curriculum and (self._global_update < self.cfg.stand_updates):
-            w_fwd_eff = 0.0
-        else:
-            w_fwd_eff = w_fwd
+            r_track_lin = torch.zeros_like(r_track_lin)
+            r_track_ang = torch.zeros_like(r_track_ang)
 
         upright = up_body[:, 2].clamp(-1, 1)
         upright_term = torch.exp(-((1.0 - upright) ** 2) / 0.1)
-
-        # NEW: explicit height term around nominal base height (0.18)height_ter
         height_term = torch.exp(-((h - 0.18) ** 2) / 0.004)
 
-
         pose_cost = (q - self.default_dof_pos).pow(2).mean(dim=-1)
-        yaw_cost = v_ang[:, 2].abs()
-        side_cost = v_lin[:, 1].abs()
 
         reward = (
             self.cfg.alive_bonus
-            + (w_fwd_eff * self.cfg.fwd_scale * v_lin[:, 0])
+            + r_track_lin
+            + r_track_ang
             + 0.5 * upright_term
             + 0.5 * height_term
             - (self.cfg.pose_penalty * pose_cost)
-            - (self.cfg.yaw_penalty * yaw_cost)
-            - (self.cfg.side_penalty * side_cost)
         )
 
-        # fade upright shaping over updates (optional)
         if self.cfg.upright_decay > 0:
             decay = math.exp(-self.cfg.upright_decay * float(self._global_update))
             reward = reward - (1.0 - decay) * 0.5 * (1.0 - upright_term)
@@ -443,7 +500,11 @@ class BlindWalkerEnv:
         reset_ids = torch.nonzero(done).squeeze(-1)
         self.reset(reset_ids)
 
-        info = {"vfwd": v_lin[:, 0], "h": h, "upright": upright}
+        err_x = (v_xy[:, 0] - cmd_xy[:, 0]).abs()
+        err_y = (v_xy[:, 1] - cmd_xy[:, 1]).abs()
+
+        info = {"v_norm": torch.norm(v_xy, dim=1), "cmd_norm": torch.norm(cmd_xy, dim=1), 
+                "h": h, "upright": upright, "err_x": err_x, "err_y": err_y}
         return obs, reward, done.float(), info
 
 
@@ -457,10 +518,6 @@ def ppo_update(
     obs, act, lp0, rew, done, val, last_val,
     cfg: CFG
 ):
-    """
-    Critical rule: anything reused across PPO epochs MUST NOT carry an autograd graph.
-    So: adv/ret/obs_n/act_flat/lp0_flat are all built under no_grad + detached.
-    """
     B, T = obs.shape[0], obs.shape[1]
 
     with torch.no_grad():
@@ -478,21 +535,17 @@ def ppo_update(
             ret[:, t] = gae + val[:, t]
             last_val = val[:, t]
 
-        # flatten + detach hard
         obs_flat = obs.reshape(-1, obs.shape[-1]).detach()
         act_flat = act.reshape(-1, act.shape[-1]).detach()
         lp0_flat = lp0.reshape(-1).detach()
         adv_flat = adv.reshape(-1)
         ret_flat = ret.reshape(-1)
 
-        # normalize obs (no grad)
         rms.update(obs_flat)
         obs_n = rms.normalize(obs_flat)
 
-        # normalize advantages
         adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
-    # PPO epochs (fresh graph each epoch through model forward only)
     for _ in range(cfg.update_epochs):
         mu, log_std, v = model(obs_n)
         std = log_std.exp()
@@ -516,16 +569,124 @@ def ppo_update(
 
 
 # -----------------------------
+# Video Recording Function
+# -----------------------------
+@torch.no_grad()
+def record_video_from_ckpt(ckpt_path: str, out_path: str, device: torch.device) -> int:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    cfg = CFG.from_dict(ckpt.get("cfg", {}))
+    cfg.envs = 1
+    cfg.cmd_mode = "external"
+
+    env = BlindWalkerOmniEnv(cfg, device, with_camera=True)
+    
+    # Needs to match exactly the obs_dim of the env and the act_dim 
+    model = ActorCritic(env.get_obs().shape[-1], 12, cfg.hidden, cfg.log_std_init).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    rms = RunningMeanStd((env.get_obs().shape[-1],), device)
+    if "rms_mean" in ckpt:
+        rms.mean = ckpt["rms_mean"].to(device)
+        rms.var = ckpt["rms_var"].to(device)
+        rms.count = ckpt["rms_count"].to(device)
+
+    print("[video] settling physics...")
+    for _ in range(40):
+        env.robot.control_dofs_position(env.default_dof_pos.unsqueeze(0), env.motor_dofs)
+        env.scene.step(update_visualizer=False, refresh_visualizer=False)
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    env.cam.start_recording()
+    try:
+        print("[video] recording omni behaviors...")
+        for i in range(cfg.video_steps):
+            if i < 200:
+                env.set_commands(torch.tensor([0.40, 0.00, 0.00], device=device))
+            elif i < 400:
+                env.set_commands(torch.tensor([0.20, 0.00, 1.00], device=device))
+            else:
+                env.set_commands(torch.tensor([0.00, -0.25, 0.00], device=device))
+
+            obs = env.get_obs()
+            a, _, _ = model.act(rms.normalize(obs), deterministic=True)
+            _, _, done, _ = env.step(a)
+
+            base_pos = env.base_link.get_pos()[0]
+            cam_offset = torch.tensor([1.2, -1.2, 0.6], device=device)
+            lookat_offset = torch.tensor([0.0, 0.0, 0.12], device=device)
+
+            cam_pos = base_pos + cam_offset
+            cam_lookat = base_pos + lookat_offset
+
+            env.cam.set_pose(
+                pos=cam_pos.cpu().numpy(),
+                lookat=cam_lookat.cpu().numpy()
+            )
+            
+            env.cam.render()
+            if bool(done.item()):
+                break
+
+        env.cam.stop_recording(save_to_filename=out_path, fps=cfg.video_fps)
+        print(f"[video] wrote {out_path}")
+        return 0
+    except Exception as e:
+        print(f"[video] record FAILED ({type(e).__name__}): {e}")
+        traceback.print_exc()
+        return 2
+
+def spawn_record_video(ckpt_path: str, out_path: str):
+    envp = os.environ.copy()
+    try_list = envp.get("VIDEO_TRY_PLATFORMS", "egl,glx,osmesa").split(",")
+    try_list = [x.strip() for x in try_list if x.strip()]
+
+    for plat in try_list:
+        envp["VIDEO_PYOPENGL_PLATFORM"] = plat
+        if plat == "egl":
+            envp.setdefault("VIDEO_EGL_PLATFORM", "surfaceless")
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--record-only",
+            "--ckpt",
+            str(Path(ckpt_path).resolve()),
+            "--out",
+            str(Path(out_path).resolve()),
+        ]
+        p = subprocess.run(cmd, env=envp, check=False)
+        if p.returncode == 0:
+            return
+        print(f"[video] failed with PYOPENGL_PLATFORM={plat} (rc={p.returncode}); trying next...")
+
+    print("[video] all backends failed (training continues).")
+
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
-    cfg = CFG()
-    seed_all(cfg.seed)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--record-only", action="store_true")
+    parser.add_argument("--ckpt", type=str, default="")
+    parser.add_argument("--out", type=str, default="rollout.mp4")
+    args = parser.parse_args()
 
+    cfg = CFG()
+    
     gs.init(backend=gs.vulkan)
     device = torch.device("cuda")
 
-    env = BlindWalkerEnv(cfg, device)
+    if args.record_only:
+        rc = record_video_from_ckpt(args.ckpt, args.out, device)
+        raise SystemExit(rc)
+
+    seed_all(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+
+    env = BlindWalkerOmniEnv(cfg, device)
     env.set_update(0)
 
     obs = env.get_obs()
@@ -537,25 +698,23 @@ def main():
     rms = RunningMeanStd((obs_dim,), device)
 
     def store(x: torch.Tensor) -> torch.Tensor:
-        # Recommended: clone rollout tensors to avoid aliasing with sim buffers.
         return x.detach().clone() if cfg.clone_rollout else x.detach()
 
-    for upd in range(1, 1_000_000):
+    print(f"Starting Omni-Tracking training with STS3215 Actuator...")
+    print(f"Tracking Sigmas: Lin={cfg.tracking_sigma_lin}, Ang={cfg.tracking_sigma_ang}")
+
+    for upd in range(1, cfg.total_updates + 1):
         env.set_update(upd)
 
-        # forward ramp
-        w_fwd = min(1.0, upd / max(1, cfg.fwd_ramp_updates))
-
         obs_b, act_b, lp_b, rew_b, don_b, val_b = [], [], [], [], [], []
-        info = {}
+        info_dict = {"v_norm": [], "cmd_norm": [], "h": [], "upright": [], "err_x": [], "err_y": []}
 
-        # --- rollout (NO grad) ---
         for _ in range(cfg.rollout_T):
             with torch.no_grad():
                 obs_in = rms.normalize(obs)
                 a, lp, v = model.act(obs_in)
 
-            next_obs, r, d, info = env.step(a, w_fwd)
+            next_obs, r, d, info = env.step(a)
 
             obs_b.append(store(obs))
             act_b.append(store(a))
@@ -563,10 +722,13 @@ def main():
             rew_b.append(store(r))
             don_b.append(store(d))
             val_b.append(store(v))
+            
+            for k in info_dict.keys():
+                if k in info:
+                    info_dict[k].append(info[k])
 
             obs = next_obs
 
-        # bootstrap value (NO grad, detached)
         with torch.no_grad():
             last_val = model(rms.normalize(obs))[2].detach()
 
@@ -584,14 +746,38 @@ def main():
 
         if upd % 10 == 0:
             mean_rew = torch.stack(rew_b, 0).mean().item()
-            mean_fwd = info["vfwd"].mean().item() if "vfwd" in info else float("nan")
-            mean_h = info["h"].mean().item() if "h" in info else float("nan")
-            mean_up = info["upright"].mean().item() if "upright" in info else float("nan")
+            mean_v = torch.stack(info_dict["v_norm"]).mean().item()
+            mean_cmd = torch.stack(info_dict["cmd_norm"]).mean().item()
+            err_x = torch.stack(info_dict["err_x"]).mean().item()
+            err_y = torch.stack(info_dict["err_y"]).mean().item()
+            mean_h = torch.stack(info_dict["h"]).mean().item()
+            
             print(
-                f"Upd {upd:06d} | Rew {mean_rew:+.3f} | Fwd {mean_fwd:+.3f} | h {mean_h:.3f} | up {mean_up:+.3f} "
-                f"| envs={cfg.envs} dt={cfg.dt} spacing={cfg.env_spacing} kick_after={cfg.kick_after_updates}"
+                f"Upd {upd:05d} | Rew {mean_rew:+.3f} | |v|={mean_v:.3f} |cmd|={mean_cmd:.3f} | "
+                f"ErrX={err_x:.3f} ErrY={err_y:.3f} | h={mean_h:.3f}"
             )
 
+        if (upd % cfg.save_every) == 0:
+            ckpt = {
+                "update": upd, "cfg": cfg.__dict__, "model": model.state_dict(), "optim": opt.state_dict(),
+                "rms_mean": rms.mean.cpu(), "rms_var": rms.var.cpu(), "rms_count": rms.count.cpu()
+            }
+            ckpt_path = os.path.join(cfg.out_dir, f"ckpt_{upd:05d}.pt")
+            torch.save(ckpt, ckpt_path)
+            print(f"💾 saved {ckpt_path}")
+
+        if cfg.record_video and (upd % cfg.video_every) == 0:
+            ckpt_path = os.path.join(cfg.out_dir, f"ckpt_{upd:05d}.pt")
+            vid_path = os.path.join(cfg.out_dir, f"video_{upd:05d}.mp4")
+
+            if not os.path.exists(ckpt_path):
+                ckpt = {
+                    "update": upd, "cfg": cfg.__dict__, "model": model.state_dict(), "optim": opt.state_dict(),
+                    "rms_mean": rms.mean.cpu(), "rms_var": rms.var.cpu(), "rms_count": rms.count.cpu()
+                }
+                torch.save(ckpt, ckpt_path)
+
+            spawn_record_video(ckpt_path, vid_path)
 
 if __name__ == "__main__":
     main()

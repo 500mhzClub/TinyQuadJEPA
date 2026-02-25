@@ -19,7 +19,7 @@ VIDEO_CAM_LOOK_Z=0.12 \
 VIDEO_CAM_SMOOTH=0.70 \
 N_ENVS=12288 \
 VIDEO_EVERY=50 \
-RESUME=runs/pupper_omni_20260225_150134/ckpt_01900.pt \
+RESUME=runs/pupper_omni_20260225_150134/ckpt_02150.pt \
 VIDEO_CMD_SWITCH=120 \
 VIDEO_ENVS=1 \
 python sim/train_blind.py
@@ -61,6 +61,35 @@ def env_float(name: str, default: float) -> float:
 def env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
+def apply_env_overrides(cfg) -> None:
+    # ints
+    if "VIDEO_EVERY" in os.environ:      cfg.video_every = int(os.environ["VIDEO_EVERY"])
+    if "VIDEO_STEPS" in os.environ:      cfg.video_steps = int(os.environ["VIDEO_STEPS"])
+    if "VIDEO_CMD_SWITCH" in os.environ: cfg.video_cmd_switch = int(os.environ["VIDEO_CMD_SWITCH"])
+    if "VIDEO_ENVS" in os.environ:       cfg.video_envs = int(os.environ["VIDEO_ENVS"])
+    if "VIDEO_W" in os.environ:          cfg.video_w = int(os.environ["VIDEO_W"])
+    if "VIDEO_H" in os.environ:          cfg.video_h = int(os.environ["VIDEO_H"])
+    if "VIDEO_FPS" in os.environ:        cfg.video_fps = int(os.environ["VIDEO_FPS"])
+
+    # bools
+    if "VIDEO_FOLLOW" in os.environ:
+        cfg.video_follow = os.environ["VIDEO_FOLLOW"].strip().lower() in ("1", "true", "yes", "y", "on")
+    if "VIDEO_CAM_LOCK_YAW" in os.environ:
+        cfg.video_cam_lock_yaw = os.environ["VIDEO_CAM_LOCK_YAW"].strip().lower() in ("1", "true", "yes", "y", "on")
+
+    # floats
+    float_map = {
+        "VIDEO_CAM_DIST": "video_cam_dist",
+        "VIDEO_CAM_SIDE": "video_cam_side",
+        "VIDEO_CAM_HEIGHT": "video_cam_height",
+        "VIDEO_CAM_LOOKAHEAD": "video_cam_lookahead",
+        "VIDEO_CAM_LOOK_Z": "video_cam_look_z",
+        "VIDEO_CAM_SMOOTH": "video_cam_smooth",
+    }
+    for envk, attr in float_map.items():
+        if envk in os.environ:
+            setattr(cfg, attr, float(os.environ[envk]))
+
 def now_tag() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
@@ -87,8 +116,14 @@ def _follow_cam_update(cam, robot_pos_xyz, robot_quat_wxyz, cfg, state: dict):
         q = torch.tensor(robot_quat_wxyz, dtype=torch.float32).unsqueeze(0)
         yaw = float(quat_to_euler_wxyz(q)[:, 2].item())
 
-    fwd = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float32)
-    right = np.array([-np.sin(yaw), np.cos(yaw), 0.0], dtype=np.float32)
+    # Choose basis: robot-yaw-relative OR world-locked (straight)
+    if getattr(cfg, "video_cam_lock_yaw", False):
+        # World axes (X forward, Y left). Camera angle stays stable.
+        fwd = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        right = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    else:
+        fwd = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float32)
+        right = np.array([-np.sin(yaw), np.cos(yaw), 0.0], dtype=np.float32)
 
     desired_pos = (
         rp
@@ -241,6 +276,7 @@ class CFG:
 
         # --- video camera follow ---
     video_follow: bool = env_bool("VIDEO_FOLLOW", "1")  # enable chase cam
+    video_cam_lock_yaw: bool = env_bool("VIDEO_CAM_LOCK_YAW", "1")      
     video_cam_dist: float = env_float("VIDEO_CAM_DIST", 0.9)       # behind robot (m)
     video_cam_height: float = env_float("VIDEO_CAM_HEIGHT", 0.45)  # above robot (m)
     video_cam_side: float = env_float("VIDEO_CAM_SIDE", -0.20)     # lateral offset (m) (+right, -left)
@@ -636,9 +672,14 @@ def pick_backend() -> Any:
 @torch.no_grad()
 def record_video_from_ckpt(ckpt_path: str, out_path: str) -> int:
     ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    # 1) Build cfg FIRST
     cfg = CFG.from_dict(ckpt.get("cfg", {}))
 
-    # IMPORTANT: only override env count for RECORDING (training still uses N_ENVS)
+    # 2) Then allow env vars to override cfg (so VIDEO_CAM_* actually works when resuming)
+    apply_env_overrides(cfg)
+
+    # 3) Only override env count for recording (training still uses N_ENVS)
     cfg.n_envs = int(getattr(cfg, "video_envs", 1))
 
     gs.init(backend=pick_backend())
@@ -649,7 +690,6 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str) -> int:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    # settle
     print("[video] settling physics...")
     for _ in range(40):
         env.robot.control_dofs_position(env.q0.unsqueeze(0).repeat(cfg.n_envs, 1), env.act_dofs)
@@ -658,7 +698,6 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str) -> int:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     env.cam.start_recording()
 
-    # demo commands on env0 (camera should follow env0)
     env0 = torch.tensor([0], device=device, dtype=torch.int64)
     sequence = [
         ("Forward",  torch.tensor([ 0.40,  0.00,  0.00], device=device)),
@@ -683,7 +722,7 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str) -> int:
             a = model.act_deterministic(obs)
             obs, _, done = env.step(a)
 
-            # Follow-cam update (AFTER stepping, BEFORE rendering)
+            # Follow camera AFTER stepping, BEFORE rendering
             if getattr(cfg, "video_follow", False):
                 pos0 = env.robot.get_pos()[0]
                 quat0 = env.robot.get_quat()[0]
@@ -691,7 +730,6 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str) -> int:
 
             env.cam.render()
 
-            # If env0 falls, reset env0 and continue the demo
             if bool(done[0].item()):
                 print(f"[video] env0 done at t={t}; resetting env0 and continuing demo...")
                 env.reset(env0)
@@ -764,6 +802,7 @@ def main():
     if resume_path:
         ckpt_resume = torch.load(resume_path, map_location="cpu")
         cfg = CFG.from_dict(ckpt_resume.get("cfg", {}))
+        apply_env_overrides(cfg)
         # optional: allow changing N_ENVS when resuming via env var
         if "N_ENVS" in os.environ:
             cfg.n_envs = env_int("N_ENVS", cfg.n_envs)

@@ -6,7 +6,11 @@ train_omni_actuator_debug.py
 
 Merges the successful robust physics/actuator/PPO pipeline of the forward-walking script
 with the omnidirectional velocity command tracking of the System-1 controller.
-Restores full debug metrics (fall/tilt/stall/timeout) to diagnose immediate death issues.
+
+Fixes: 
+- Actuator command queue is now properly initialized to the standing pose instead of zeros, 
+  preventing instant leg-folding and death-on-spawn.
+- last_action is properly cleared on reset.
 """
 
 import os
@@ -98,11 +102,14 @@ class STS3215_Actuator:
         torque_limit = torque_limit.clamp_min(0.0)
         return torch.clamp(torque, -torque_limit, torque_limit)
 
-    def reset(self, env_ids: torch.Tensor | None):
+    def reset(self, env_ids: torch.Tensor | None, default_pos: torch.Tensor):
+        """
+        FIXED: Initialize queue to the standing pose, NOT zeros.
+        """
         if env_ids is None:
-            self.command_queue.zero_()
+            self.command_queue[:] = default_pos.view(1, 12, 1).expand(self.num_envs, 12, self.history_len)
         else:
-            self.command_queue[env_ids] = 0.0
+            self.command_queue[env_ids] = default_pos.view(1, 12, 1).expand(len(env_ids), 12, self.history_len)
 
 
 # -----------------------------
@@ -435,7 +442,9 @@ class BlindWalkerOmniEnv:
         self.episode_length[env_ids] = 0
         self.stall_counters[env_ids] = 0
         self.cmd_timers[env_ids] = 0
-        self.actuator.reset(env_ids)
+        
+        # FIXED: Explicitly zero out the previous action
+        self.last_action[env_ids] = 0.0
 
         if self.cfg.cmd_mode.lower() != "external":
             self.commands[env_ids] = self._sample_cmd(len(env_ids))
@@ -445,6 +454,9 @@ class BlindWalkerOmniEnv:
 
         q = self.default_dof_pos.unsqueeze(0) + (torch.rand((len(env_ids), 12), device=self.device) * 2 - 1) * 0.10
         self.robot.set_dofs_position(q, self.motor_dofs, envs_idx=env_ids)
+        
+        # FIXED: Initialize command queue to the standing pose to prevent massive initial torques
+        self.actuator.reset(env_ids, self.default_dof_pos)
 
         if self._global_update >= self.cfg.kick_after_updates:
             self._kick_base_velocity(env_ids)

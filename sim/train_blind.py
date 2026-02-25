@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 """
-train_omni_actuator_survival.py
+train_omni_actuator_debug.py
 
 Merges the successful robust physics/actuator/PPO pipeline of the forward-walking script
 with the omnidirectional velocity command tracking of the System-1 controller.
+Restores full debug metrics (fall/tilt/stall/timeout) to diagnose immediate death issues.
 """
 
 import os
@@ -70,7 +71,7 @@ def seed_all(seed: int) -> None:
 
 
 # -----------------------------
-# STS3215 Actuator Model (PD + speed-dependent torque limit + latency)
+# STS3215 Actuator Model
 # -----------------------------
 class STS3215_Actuator:
     def __init__(self, num_envs: int, device: torch.device, dt: float = 0.01):
@@ -112,6 +113,19 @@ def quat_rotate_wxyz(q, v):
     t = 2.0 * torch.cross(q_vec, v, dim=-1)
     return v + q_w * t + torch.cross(q_vec, t, dim=-1)
 
+def quat_to_euler_wxyz(q: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr_cosp, cosr_cosp)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)
+    pitch = torch.asin(sinp)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny_cosp, cosy_cosp)
+    return torch.stack([roll, pitch, yaw], dim=-1)
+
 
 # -----------------------------
 # PPO network & Normalizer
@@ -144,7 +158,6 @@ class ActorCritic(nn.Module):
         logp = (-0.5 * (((a - mu) ** 2) / (log_std.exp() ** 2 + 1e-8) + 2.0 * log_std + math.log(2.0 * math.pi))).sum(dim=-1)
         return a, logp, v
 
-
 class RunningMeanStd:
     def __init__(self, shape, device):
         self.mean = torch.zeros(shape, device=device)
@@ -172,12 +185,10 @@ class RunningMeanStd:
 # -----------------------------
 @dataclass
 class CFG:
-    # sim
     envs: int = _env_int("ENVS", 1024)
     dt: float = _env_float("DT", 0.01)
     env_spacing: Tuple[float, float] = _env_tuple2("ENV_SPACING", (2.5, 2.5))
 
-    # robot/control
     action_scale: float = _env_float("ACTION_SCALE", 0.65)
     force_limit: float = _env_float("FORCE_LIMIT", 30.0)
 
@@ -189,12 +200,11 @@ class CFG:
     cmd_mode: str = _env_str("CMD_MODE", "random")
     cmd_hold_steps: int = _env_int("CMD_HOLD_STEPS", 200)
 
-    # shaping / curriculum
+    # --- REWARDS ---
     curriculum: bool = _env_bool("CURRICULUM", "1")
     stand_updates: int = _env_int("STAND_UPDATES", 0)
     upright_decay: float = _env_float("UPRIGHT_DECAY", 0.3)
     
-    # Tracking Rewards
     w_track_lin: float = _env_float("W_TRACK_LIN", 10.0)
     w_track_ang: float = _env_float("W_TRACK_ANG", 5.0)
     tracking_sigma_lin: float = _env_float("TRACKING_SIGMA_LIN", 0.25)
@@ -203,11 +213,17 @@ class CFG:
     pose_penalty: float = _env_float("POSE_PENALTY", 1e-4)
     alive_bonus: float = _env_float("ALIVE_BONUS", 0.0)
 
-    # episode termination
+    # --- TERMINATIONS ---
     fall_h: float = _env_float("FALL_H", 0.10)
+    max_tilt: float = _env_float("MAX_TILT", 1.0)
     ep_len: int = _env_int("EP_LEN", 800)
 
-    # PPO
+    stall_cmd_thresh: float = _env_float("STALL_CMD_THRESH", 0.20)
+    stall_frac: float = _env_float("STALL_FRAC", 0.0) 
+    stall_timeout_steps: int = _env_int("STALL_TIMEOUT", 40)
+    stall_grace_steps: int = _env_int("STALL_GRACE", 80)
+
+    # --- PPO ---
     hidden: int = _env_int("HIDDEN", 256)
     log_std_init: float = _env_float("LOG_STD_INIT", -1.0)
     lr: float = _env_float("LR", 3e-4)
@@ -220,11 +236,9 @@ class CFG:
     rollout_T: int = _env_int("ROLLOUT_T", 256)
     total_updates: int = _env_int("UPDATES", 10000)
 
-    # reset / rollout safety
     kick_after_updates: int = _env_int("KICK_AFTER_UPDATES", 500)
     clone_rollout: bool = _env_bool("CLONE_ROLLOUT", "1")
 
-    # misc
     seed: int = _env_int("SEED", 0)
     urdf: str = _env_str("URDF", "./assets/mini_pupper/mini_pupper.urdf")
 
@@ -251,6 +265,11 @@ class CFG:
 # Genesis Env
 # -----------------------------
 class BlindWalkerOmniEnv:
+    TERM_FALL = 0
+    TERM_TILT = 1
+    TERM_STALL = 2
+    TERM_TO = 3
+
     def __init__(self, cfg: CFG, device: torch.device, with_camera: bool = False):
         self.cfg = cfg
         self.device = device
@@ -306,18 +325,38 @@ class BlindWalkerOmniEnv:
 
         self.actuator = STS3215_Actuator(cfg.envs, device, dt=cfg.dt)
         self.last_action = torch.zeros((cfg.envs, 12), device=device)
-        self.episode_length = torch.zeros(cfg.envs, device=device)
-
+        
+        self.episode_length = torch.zeros(cfg.envs, device=device, dtype=torch.int32)
+        self.stall_counters = torch.zeros(cfg.envs, device=device, dtype=torch.int32)
+        
         self.commands = torch.zeros(cfg.envs, 3, device=device, dtype=torch.float32)
         self.cmd_timers = torch.zeros(cfg.envs, device=device, dtype=torch.int32)
         self.vx_max = max(abs(cfg.cmd_vx_range[0]), abs(cfg.cmd_vx_range[1]))
         self.vy_max = max(abs(cfg.cmd_vy_range[0]), abs(cfg.cmd_vy_range[1]))
         self.wz_max = max(abs(cfg.cmd_wz_range[0]), abs(cfg.cmd_wz_range[1]))
 
+        # Termination Tracking Metrics
+        self._term_counts = torch.zeros(4, device=device, dtype=torch.int64)
+        self._term_total = torch.zeros(1, device=device, dtype=torch.int64)
+
         self.reset(torch.arange(cfg.envs, device=device))
 
     def set_update(self, upd: int):
         self._global_update = upd
+
+    @torch.no_grad()
+    def fetch_and_reset_term_stats(self) -> Dict[str, float]:
+        total = max(1, int(self._term_total.item()))
+        out = {
+            "total": float(total),
+            "fall": float(self._term_counts[self.TERM_FALL].item()),
+            "tilt": float(self._term_counts[self.TERM_TILT].item()),
+            "stall": float(self._term_counts[self.TERM_STALL].item()),
+            "to": float(self._term_counts[self.TERM_TO].item()),
+        }
+        self._term_counts.zero_()
+        self._term_total.zero_()
+        return out
 
     def _sample_cmd(self, n: int) -> torch.Tensor:
         vx_lo, vx_hi = self.cfg.cmd_vx_range
@@ -394,6 +433,7 @@ class BlindWalkerOmniEnv:
             return
 
         self.episode_length[env_ids] = 0
+        self.stall_counters[env_ids] = 0
         self.cmd_timers[env_ids] = 0
         self.actuator.reset(env_ids)
 
@@ -495,17 +535,58 @@ class BlindWalkerOmniEnv:
             decay = math.exp(-self.cfg.upright_decay * float(self._global_update))
             reward = reward - (1.0 - decay) * 0.5 * (1.0 - upright_term)
 
-        self.episode_length += 1
-        done = (h < self.cfg.fall_h) | (self.episode_length >= self.cfg.ep_len)
+        # -----------------------------
+        # Terminations
+        # -----------------------------
+        quat = self.base_link.get_quat()
+        eul = quat_to_euler_wxyz(quat)
+        roll = eul[:, 0]
+        pitch = eul[:, 1]
 
-        reset_ids = torch.nonzero(done).squeeze(-1)
-        self.reset(reset_ids)
+        tilted = (torch.abs(roll) > self.cfg.max_tilt) | (torch.abs(pitch) > self.cfg.max_tilt)
+        fallen = h < self.cfg.fall_h
+        time_out = self.episode_length >= self.cfg.ep_len
+
+        # Stall Logic
+        v_norm = torch.norm(v_xy, dim=1)
+        cmd_norm = torch.norm(cmd_xy, dim=1).clamp_min(1e-6)
+        cmd_active = cmd_norm > float(self.cfg.stall_cmd_thresh)
+
+        vel_low_rel = v_norm < (float(self.cfg.stall_frac) * cmd_norm)
+        stall_candidate = cmd_active & vel_low_rel & (self.episode_length > int(self.cfg.stall_grace_steps))
+
+        self.stall_counters = torch.where(stall_candidate, self.stall_counters + 1, torch.zeros_like(self.stall_counters))
+        stalled_out = self.stall_counters > int(self.cfg.stall_timeout_steps)
+
+        done = tilted | fallen | time_out | stalled_out
+
+        done_ids = torch.nonzero(done).squeeze(-1)
+        if done_ids.numel() > 0:
+            self._term_total += done_ids.numel()
+            self._term_counts[self.TERM_FALL] += fallen[done_ids].to(torch.int64).sum()
+            self._term_counts[self.TERM_TILT] += tilted[done_ids].to(torch.int64).sum()
+            self._term_counts[self.TERM_STALL] += stalled_out[done_ids].to(torch.int64).sum()
+            self._term_counts[self.TERM_TO] += time_out[done_ids].to(torch.int64).sum()
+
+        self.episode_length += 1
+
+        if done_ids.numel() > 0:
+            self.reset(done_ids)
 
         err_x = (v_xy[:, 0] - cmd_xy[:, 0]).abs()
         err_y = (v_xy[:, 1] - cmd_xy[:, 1]).abs()
 
-        info = {"v_norm": torch.norm(v_xy, dim=1), "cmd_norm": torch.norm(cmd_xy, dim=1), 
-                "h": h, "upright": upright, "err_x": err_x, "err_y": err_y}
+        info = {
+            "v_norm": v_norm, 
+            "cmd_norm": cmd_norm, 
+            "h": h, 
+            "upright": upright, 
+            "err_x": err_x, 
+            "err_y": err_y,
+            "cmd_active": cmd_active.float(),
+            "stalled": vel_low_rel.float(),
+            "ep_len": self.episode_length.float()
+        }
         return obs, reward, done.float(), info
 
 
@@ -581,7 +662,6 @@ def record_video_from_ckpt(ckpt_path: str, out_path: str, device: torch.device) 
 
     env = BlindWalkerOmniEnv(cfg, device, with_camera=True)
     
-    # Needs to match exactly the obs_dim of the env and the act_dim 
     model = ActorCritic(env.get_obs().shape[-1], 12, cfg.hidden, cfg.log_std_init).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -704,11 +784,18 @@ def main():
     print(f"Starting Omni-Tracking training with STS3215 Actuator...")
     print(f"Tracking Sigmas: Lin={cfg.tracking_sigma_lin}, Ang={cfg.tracking_sigma_ang}")
 
+    import time
+    t0 = time.time()
+    global_steps = 0
+
     for upd in range(1, cfg.total_updates + 1):
         env.set_update(upd)
 
         obs_b, act_b, lp_b, rew_b, don_b, val_b = [], [], [], [], [], []
-        info_dict = {"v_norm": [], "cmd_norm": [], "h": [], "upright": [], "err_x": [], "err_y": []}
+        info_dict = {
+            "v_norm": [], "cmd_norm": [], "h": [], "err_x": [], "err_y": [],
+            "cmd_active": [], "stalled": [], "ep_len": []
+        }
 
         for _ in range(cfg.rollout_T):
             with torch.no_grad():
@@ -729,6 +816,7 @@ def main():
                     info_dict[k].append(info[k])
 
             obs = next_obs
+            global_steps += cfg.envs
 
         with torch.no_grad():
             last_val = model(rms.normalize(obs))[2].detach()
@@ -745,17 +833,36 @@ def main():
             cfg
         )
 
+        dt_s = max(1e-6, time.time() - t0)
+        env_fps = global_steps / dt_s
+
         if upd % 10 == 0:
             mean_rew = torch.stack(rew_b, 0).mean().item()
-            mean_v = torch.stack(info_dict["v_norm"]).mean().item()
-            mean_cmd = torch.stack(info_dict["cmd_norm"]).mean().item()
+            vmag = torch.stack(info_dict["v_norm"]).mean().item()
+            
+            cmd_t = torch.stack(info_dict["cmd_norm"])
+            cmag = cmd_t.mean().item()
+            cmin = cmd_t.min().item()
+            cmax = cmd_t.max().item()
+
             err_x = torch.stack(info_dict["err_x"]).mean().item()
             err_y = torch.stack(info_dict["err_y"]).mean().item()
             mean_h = torch.stack(info_dict["h"]).mean().item()
             
+            cmd_act = torch.stack(info_dict["cmd_active"]).mean().item() * 100
+            stalled = torch.stack(info_dict["stalled"]).mean().item() * 100
+            ep_len_mean = torch.stack(info_dict["ep_len"]).mean().item()
+
+            term = env.fetch_and_reset_term_stats()
+            ttot = max(1.0, term["total"])
+            term_str = f"term(fall={100*term['fall']/ttot:.1f}%, tilt={100*term['tilt']/ttot:.1f}%, stall={100*term['stall']/ttot:.1f}%, to={100*term['to']/ttot:.1f}%)"
+
             print(
-                f"Upd {upd:05d} | Rew {mean_rew:+.3f} | |v|={mean_v:.3f} |cmd|={mean_cmd:.3f} | "
-                f"ErrX={err_x:.3f} ErrY={err_y:.3f} | h={mean_h:.3f}"
+                f"upd={upd:05d}  env_fps={env_fps:10.0f}  "
+                f"mean_rew={mean_rew:+.3f}  ErrX={err_x:.3f}  ErrY={err_y:.3f}  "
+                f"h={mean_h:.3f}  |v|={vmag:.3f}  |cmd|={cmag:.3f} (min={cmin:.3f} max={cmax:.3f})  "
+                f"cmd_act={cmd_act:5.1f}%  stalled~={stalled:5.1f}%  "
+                f"ep_len={ep_len_mean:6.1f}  {term_str}"
             )
 
         if (upd % cfg.save_every) == 0:

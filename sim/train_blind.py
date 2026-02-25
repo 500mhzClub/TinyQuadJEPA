@@ -218,6 +218,7 @@ class CFG:
     ent_coef: float = _env_float("ENT_COEF", 0.02)
     update_epochs: int = _env_int("UPDATE_EPOCHS", 4)
     rollout_T: int = _env_int("ROLLOUT_T", 256)
+    total_updates: int = _env_int("UPDATES", 10000)
 
     # reset / rollout safety
     kick_after_updates: int = _env_int("KICK_AFTER_UPDATES", 500)

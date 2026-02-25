@@ -13,19 +13,19 @@ N_ENVS=12288 VIDEO_EVERY=50 RESUME=runs/pupper_omni_20260225_150134/ckpt_01900.p
 
 VIDEO_FOLLOW=1 \
 VIDEO_CAM_LOCK_YAW=1 \
-VIDEO_CAM_DIST=0.0 \
-VIDEO_CAM_SIDE=-0.90 \
-VIDEO_CAM_LOOKAHEAD=0.0 \
-VIDEO_CAM_HEIGHT=0.35 \
-VIDEO_CAM_LOOK_Z=0.12 \
-VIDEO_CAM_SMOOTH=0.70 \
+VIDEO_CAM_DIST=-0.80 \
+VIDEO_CAM_SIDE=-0.80 \
+VIDEO_CAM_HEIGHT=0.80 \
+VIDEO_CAM_LOOKAHEAD=0.00 \
+VIDEO_CAM_LOOK_Z=0.10 \
+VIDEO_CAM_SMOOTH=0.80 \
+VIDEO_ENVS=1 \
 N_ENVS=12288 \
 VIDEO_EVERY=50 \
-RESUME=runs/pupper_omni_20260225_150134/ckpt_01900.pt \
+RESUME=runs/pupper_omni_20260225_150134/ckpt_02700.pt \
 VIDEO_CMD_SWITCH=120 \
 VIDEO_ENVS=1 \
 python sim/train_blind.py
-
 """
 import os
 import sys
@@ -147,7 +147,18 @@ def _follow_cam_update(cam, robot_pos_xyz, robot_quat_wxyz, cfg, state: dict):
         state["pos"] = a * state["pos"] + (1.0 - a) * desired_pos
         state["look"] = a * state["look"] + (1.0 - a) * desired_look
 
-    cam.set_pose(pos=state["pos"], lookat=state["look"])
+    # Keep the horizon level: force world-up
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    # Genesis versions differ slightly in arg names; try the common ones.
+    try:
+        cam.set_pose(pos=state["pos"], lookat=state["look"], up=up)
+    except TypeError:
+        try:
+            cam.set_pose(pos=state["pos"], lookat=state["look"], up_vector=up)
+        except TypeError:
+            # Fallback: at least update pos/lookat (may still roll)
+            cam.set_pose(pos=state["pos"], lookat=state["look"])
 
 def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
     return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)

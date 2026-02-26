@@ -9,8 +9,6 @@ Key knobs:
 - VIDEO_CMD_SWITCH: in the demo video, switch command every N SIM steps (default 120)
 - VIDEO_ENVS: number of envs in the record-only subprocess (default 1; training still uses N_ENVS)
 
-N_ENVS=12288 VIDEO_EVERY=50 RESUME=runs/pupper_omni_20260225_150134/ckpt_01900.pt  VIDEO_CMD_SWITCH=120 VIDEO_ENVS=1 python sim/train_blind.py
-
 VIDEO_FOLLOW=1 \
 VIDEO_CAM_LOCK_YAW=1 \
 VIDEO_CAM_DIST=-0.80 \

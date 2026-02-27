@@ -3,7 +3,6 @@
   <material name="yellow"><color rgba="1 0.8 0 1"/></material>
   <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
 
-  <!-- ================= Base ================= -->
   <link name="base_link">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -11,13 +10,11 @@
       <material name="yellow"/>
     </visual>
 
-    <!-- Align collision box to the base mesh which sits roughly on z>=0 -->
     <collision>
       <origin xyz="0 0 0.03500" rpy="0 0 0"/>
       <geometry><box size="0.18110 0.07000 0.07000"/></geometry>
     </collision>
 
-    <!-- Put COM roughly mid-height -->
     <inertial>
       <origin xyz="0 0 0.03500" rpy="0 0 0"/>
       <mass value="0.56000"/>
@@ -25,7 +22,6 @@
     </inertial>
   </link>
 
-  <!-- ================= LF Leg ================= -->
   <joint name="lf_hip_joint" type="revolute">
     <parent link="base_link"/>
     <child link="lf_hip"/>
@@ -50,7 +46,6 @@
     </inertial>
   </link>
 
-  <!-- Thigh -->
   <joint name="lf_thigh_joint" type="revolute">
     <parent link="lf_hip"/>
     <child link="lf_thigh"/>
@@ -75,7 +70,6 @@
     </inertial>
   </link>
 
-  <!-- Calf: IMPORTANT: allow 0 so qpos0 doesn't violate limits -->
   <joint name="lf_calf_joint" type="revolute">
     <parent link="lf_thigh"/>
     <child link="lf_calf"/>
@@ -100,7 +94,6 @@
     </inertial>
   </link>
 
-  <!-- Foot -->
   <joint name="lf_foot_fixed" type="fixed">
     <parent link="lf_calf"/>
     <child link="lf_foot"/>
@@ -123,7 +116,6 @@
     </inertial>
   </link>
 
-  <!-- ================= LH Leg ================= -->
   <joint name="lh_hip_joint" type="revolute">
     <parent link="base_link"/>
     <child link="lh_hip"/>
@@ -148,7 +140,6 @@
     </inertial>
   </link>
 
-  <!-- Thigh -->
   <joint name="lh_thigh_joint" type="revolute">
     <parent link="lh_hip"/>
     <child link="lh_thigh"/>
@@ -173,7 +164,6 @@
     </inertial>
   </link>
 
-  <!-- Calf: IMPORTANT: allow 0 so qpos0 doesn't violate limits -->
   <joint name="lh_calf_joint" type="revolute">
     <parent link="lh_thigh"/>
     <child link="lh_calf"/>
@@ -198,7 +188,6 @@
     </inertial>
   </link>
 
-  <!-- Foot -->
   <joint name="lh_foot_fixed" type="fixed">
     <parent link="lh_calf"/>
     <child link="lh_foot"/>
@@ -221,7 +210,6 @@
     </inertial>
   </link>
 
-  <!-- ================= RF Leg ================= -->
   <joint name="rf_hip_joint" type="revolute">
     <parent link="base_link"/>
     <child link="rf_hip"/>
@@ -246,7 +234,6 @@
     </inertial>
   </link>
 
-  <!-- Thigh -->
   <joint name="rf_thigh_joint" type="revolute">
     <parent link="rf_hip"/>
     <child link="rf_thigh"/>
@@ -271,7 +258,6 @@
     </inertial>
   </link>
 
-  <!-- Calf: IMPORTANT: allow 0 so qpos0 doesn't violate limits -->
   <joint name="rf_calf_joint" type="revolute">
     <parent link="rf_thigh"/>
     <child link="rf_calf"/>
@@ -296,7 +282,6 @@
     </inertial>
   </link>
 
-  <!-- Foot -->
   <joint name="rf_foot_fixed" type="fixed">
     <parent link="rf_calf"/>
     <child link="rf_foot"/>
@@ -319,7 +304,6 @@
     </inertial>
   </link>
 
-  <!-- ================= RH Leg ================= -->
   <joint name="rh_hip_joint" type="revolute">
     <parent link="base_link"/>
     <child link="rh_hip"/>
@@ -344,7 +328,6 @@
     </inertial>
   </link>
 
-  <!-- Thigh -->
   <joint name="rh_thigh_joint" type="revolute">
     <parent link="rh_hip"/>
     <child link="rh_thigh"/>
@@ -369,7 +352,6 @@
     </inertial>
   </link>
 
-  <!-- Calf: IMPORTANT: allow 0 so qpos0 doesn't violate limits -->
   <joint name="rh_calf_joint" type="revolute">
     <parent link="rh_thigh"/>
     <child link="rh_calf"/>
@@ -394,7 +376,6 @@
     </inertial>
   </link>
 
-  <!-- Foot -->
   <joint name="rh_foot_fixed" type="fixed">
     <parent link="rh_calf"/>
     <child link="rh_foot"/>
@@ -411,6 +392,26 @@
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry><sphere radius="0.012"/></geometry>
     </collision>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000001" iyz="0" izz="0.000001"/>
+    </inertial>
+  </link>
+
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.09055 0 0.07000" rpy="0 0.26180 0"/>
+  </joint>
+
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.01 0.02 0.02"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
     <inertial>
       <mass value="0.01"/>
       <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000001" iyz="0" izz="0.000001"/>

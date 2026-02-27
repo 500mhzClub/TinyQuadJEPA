@@ -15,7 +15,7 @@ def write_urdf():
     out_file  = asset_dir / "mini_pupper.urdf"
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Base mesh (from your STL bounds it’s already ~meters scale; no 1.82m offset needed)
+    # Base mesh
     base_x, base_y, base_z = 0.1811, 0.0700, 0.0700
     base_m = 0.56
     base_Ixx, base_Iyy, base_Izz = box_inertia(base_m, base_x, base_y, base_z)
@@ -37,7 +37,6 @@ def write_urdf():
   <material name="yellow"><color rgba="1 0.8 0 1"/></material>
   <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
 
-  <!-- ================= Base ================= -->
   <link name="base_link">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -45,13 +44,11 @@ def write_urdf():
       <material name="yellow"/>
     </visual>
 
-    <!-- Align collision box to the base mesh which sits roughly on z>=0 -->
     <collision>
       <origin xyz="0 0 {base_z/2:.5f}" rpy="0 0 0"/>
       <geometry><box size="{base_x:.5f} {base_y:.5f} {base_z:.5f}"/></geometry>
     </collision>
 
-    <!-- Put COM roughly mid-height -->
     <inertial>
       <origin xyz="0 0 {base_z/2:.5f}" rpy="0 0 0"/>
       <mass value="{base_m:.5f}"/>
@@ -63,7 +60,6 @@ def write_urdf():
     for name, x, y, side in legs:
         # Hip link
         urdf += f"""
-  <!-- ================= {name.upper()} Leg ================= -->
   <joint name="{name}_hip_joint" type="revolute">
     <parent link="base_link"/>
     <child link="{name}_hip"/>
@@ -88,7 +84,6 @@ def write_urdf():
     </inertial>
   </link>
 
-  <!-- Thigh -->
   <joint name="{name}_thigh_joint" type="revolute">
     <parent link="{name}_hip"/>
     <child link="{name}_thigh"/>
@@ -113,7 +108,6 @@ def write_urdf():
     </inertial>
   </link>
 
-  <!-- Calf: IMPORTANT: allow 0 so qpos0 doesn't violate limits -->
   <joint name="{name}_calf_joint" type="revolute">
     <parent link="{name}_thigh"/>
     <child link="{name}_calf"/>
@@ -138,7 +132,6 @@ def write_urdf():
     </inertial>
   </link>
 
-  <!-- Foot -->
   <joint name="{name}_foot_fixed" type="fixed">
     <parent link="{name}_calf"/>
     <child link="{name}_foot"/>
@@ -161,6 +154,31 @@ def write_urdf():
     </inertial>
   </link>
 """
+
+    # --- System 2 Camera Link ---
+    pitch_15_deg = math.radians(15)
+    urdf += f"""
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="{base_x/2:.5f} 0 {base_z:.5f}" rpy="0 {pitch_15_deg:.5f} 0"/>
+  </joint>
+
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.01 0.02 0.02"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000001" iyz="0" izz="0.000001"/>
+    </inertial>
+  </link>
+"""
+
     urdf += "\n</robot>\n"
     out_file.write_text(urdf)
     print(f"✅ Wrote: {out_file}")

@@ -325,8 +325,8 @@ def main():
 
     total_phases = len(demo_sequence)
 
-    print(f"\n🚀 Running Continuous Sequential Benchmark on {args.ckpt}")
-    print(f"Tracking transitions dynamically. {args.phase_steps} steps per phase.\n")
+    print(f"\n🚀 Running True Velocity Benchmark on {args.ckpt}")
+    print(f"Tracking ACTUAL signed velocities dynamically. {args.phase_steps} steps per phase.\n")
 
     for _ in range(40):
         env.robot.control_dofs_position(env.q0.unsqueeze(0).repeat(cfg.n_envs, 1), env.act_dofs)
@@ -344,11 +344,12 @@ def main():
         
         cmds = torch.tensor([demo_cmd, max_cmd], device=device, dtype=torch.float32)
         env.set_commands_batch(cmds)
-        obs = env.get_obs() # IMMEDIATELY BAKE IN THE NEW COMMAND TO OBS
+        obs = env.get_obs()
         
-        err_vx = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
-        err_vy = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
-        err_om = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
+        # Track ACTUAL sum instead of Error sum
+        act_vx_sum = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
+        act_vy_sum = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
+        act_om_sum = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
         valid_steps = torch.zeros(cfg.n_envs, dtype=torch.float32, device=device)
 
         for step in range(args.phase_steps):
@@ -359,33 +360,36 @@ def main():
             if step > args.warmup: 
                 for i in range(2):
                     if is_alive[i]:
-                        err_vx[i] += torch.abs(info["v_fwd"][i] - cmds[i, 0])
-                        err_vy[i] += torch.abs(info["v_lat"][i] - cmds[i, 1])
-                        err_om[i] += torch.abs(info["yaw_rate"][i] - cmds[i, 2])
+                        act_vx_sum[i] += info["v_fwd"][i]
+                        act_vy_sum[i] += info["v_lat"][i]
+                        act_om_sum[i] += info["yaw_rate"][i]
                         valid_steps[i] += 1.0
 
         def format_res(idx, name):
             if not is_alive[idx]:
                 return f"{name:<15} | N/A (Fell down)"
             if valid_steps[idx] > 0:
-                mx = err_vx[idx] / valid_steps[idx]
-                my = err_vy[idx] / valid_steps[idx]
-                mo = err_om[idx] / valid_steps[idx]
-                return f"{name:<15} | MAE vx: {mx.item():.4f} | MAE vy: {my.item():.4f} | MAE ω: {mo.item():.4f}"
+                ax = act_vx_sum[idx] / valid_steps[idx]
+                ay = act_vy_sum[idx] / valid_steps[idx]
+                ao = act_om_sum[idx] / valid_steps[idx]
+                
+                cmd_str = f"CMD [{cmds[idx,0]:>5.2f}, {cmds[idx,1]:>5.2f}, {cmds[idx,2]:>5.2f}]"
+                act_str = f"ACT [{ax.item():>5.2f}, {ay.item():>5.2f}, {ao.item():>5.2f}]"
+                return f"{name:<15} | {cmd_str}  ->  {act_str}"
             return f"{name:<15} | N/A"
 
         results_demo.append(format_res(0, demo_name))
         results_max.append(format_res(1, max_name))
 
-    print("="*75)
+    print("="*85)
     print("ENV 0: CONTINUOUS DEMO SEQUENCE")
-    print("-" * 75)
+    print("-" * 85)
     for r in results_demo: print(r)
-    print("="*75)
+    print("="*85)
     print("ENV 1: CONTINUOUS MAX SEQUENCE")
-    print("-" * 75)
+    print("-" * 85)
     for r in results_max: print(r)
-    print("="*75 + "\n")
+    print("="*85 + "\n")
 
 if __name__ == "__main__":
     main()

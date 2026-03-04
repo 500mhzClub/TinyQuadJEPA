@@ -1,75 +1,133 @@
 #!/usr/bin/env python3
 """
 System 2 EBM JEPA Training Loop (VICReg Formulation)
-Optimized for high-VRAM / high-core-count workstations.
+Optimized with AMP, PyTorch Compiler, Worker-Side Batching, and Late GPU Casting.
 
 Usage:
     python JEPA/train_jepa.py
 """
 import os
 import glob
+import random
 import h5py
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
+from collections import defaultdict
 
-# Enable hardware autotuning for the CNN operations
 torch.backends.cudnn.benchmark = True
 
 # -----------------------------------------
-# 1. Sequence Dataset Loader
+# 1. RAM-Buffered Streaming Dataset
 # -----------------------------------------
-class JEPADataset(Dataset):
-    def __init__(self, data_dir: str, seq_len: int = 16):
+class StreamingJEPADataset(IterableDataset):
+    def __init__(self, data_dir: str, seq_len: int = 16, envs_per_chunk: int = 64, global_batch_size: int = 2048):
         self.data_dir = data_dir
         self.seq_len = seq_len
+        self.envs_per_chunk = envs_per_chunk
+        self.global_batch_size = global_batch_size
         self.h5_files = sorted(glob.glob(os.path.join(data_dir, "*_rgb.h5")))
         
         if not self.h5_files:
             raise FileNotFoundError(f"❌ No HDF5 datasets found in {data_dir}")
             
-        self.samples = []
-        print("🔍 Indexing S2W Dataset for valid temporal sequences...")
-        
-        for file_idx, fpath in enumerate(self.h5_files):
+        self.global_envs = []
+        print("🔍 Mapping global environments...")
+        for fpath in self.h5_files:
             try:
                 with h5py.File(fpath, 'r') as h5f:
-                    N, T = h5f['vision'].shape[:2]
-                    max_start_t = T - self.seq_len
+                    N = h5f['vision'].shape[0]
                     for env_idx in range(N):
-                        # We slide a window of size `seq_len` across the trajectory
-                        for start_t in range(max_start_t + 1):
-                            self.samples.append((file_idx, env_idx, start_t))
+                        self.global_envs.append((fpath, env_idx))
             except Exception as e:
                 print(f"⚠️ Warning: Could not index {fpath} ({e})")
                 
-        print(f"✅ Found {len(self.samples):,} valid {seq_len}-step sequences.")
+        print(f"✅ Indexed {len(self.global_envs):,} environments.")
 
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        file_idx, env_idx, start_t = self.samples[idx]
-        fpath = self.h5_files[file_idx]
-        end_t = start_t + self.seq_len
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
         
-        with h5py.File(fpath, 'r') as h5f:
-            # (Time, Channels, Height, Width) -> Normalized to [0.0, 1.0]
-            vision = torch.from_numpy(h5f['vision'][env_idx, start_t:end_t]).float() / 255.0
-            proprio = torch.from_numpy(h5f['proprio'][env_idx, start_t:end_t]).float()
-            cmds = torch.from_numpy(h5f['cmds'][env_idx, start_t:end_t]).float()
-            dones = torch.from_numpy(h5f['dones'][env_idx, start_t:end_t]).bool()
+        if worker_info is None:
+            my_envs = self.global_envs
+            seed = 0
+        else:
+            # Distribute environments evenly across active workers
+            my_envs = self.global_envs[worker_info.id :: worker_info.num_workers]
+            seed = worker_info.id
 
-        return vision, proprio, cmds, dones
+        rng = random.Random(seed)
+        rng.shuffle(my_envs)
+        
+        # The worker builds the entire batch itself to bypass PyTorch collation overhead
+        batch_v, batch_p, batch_c, batch_d = [], [], [], []
+
+        for i in range(0, len(my_envs), self.envs_per_chunk):
+            chunk_envs = my_envs[i : i + self.envs_per_chunk]
+            
+            vision_list, prop_list, cmd_list, done_list = [], [], [], []
+            
+            file_groups = defaultdict(list)
+            for fpath, env_idx in chunk_envs:
+                file_groups[fpath].append(env_idx)
+
+            for fpath, indices in file_groups.items():
+                indices.sort() 
+                with h5py.File(fpath, 'r') as h5f:
+                    v = h5f['vision'][indices] 
+                    p = h5f['proprio'][indices]
+                    c = h5f['cmds'][indices]
+                    d = h5f['dones'][indices]
+                    
+                    for local_idx in range(len(indices)):
+                        # 🔥 Loaded as strict uint8/float32 to minimize RAM footprint
+                        vision_list.append(torch.from_numpy(v[local_idx])) 
+                        prop_list.append(torch.from_numpy(p[local_idx]).float())
+                        cmd_list.append(torch.from_numpy(c[local_idx]).float())
+                        done_list.append(torch.from_numpy(d[local_idx]).bool())
+
+            sequences = []
+            num_envs_loaded = len(vision_list)
+            T = vision_list[0].shape[0]
+            max_start_t = T - self.seq_len
+
+            for e_idx in range(num_envs_loaded):
+                for start_t in range(max_start_t + 1):
+                    sequences.append((e_idx, start_t))
+
+            rng.shuffle(sequences)
+
+            # 🔥 Worker-Side Batching
+            for e_idx, start_t in sequences:
+                end_t = start_t + self.seq_len
+                
+                batch_v.append(vision_list[e_idx][start_t:end_t])
+                batch_p.append(prop_list[e_idx][start_t:end_t])
+                batch_c.append(cmd_list[e_idx][start_t:end_t])
+                batch_d.append(done_list[e_idx][start_t:end_t])
+                
+                if len(batch_v) == self.global_batch_size:
+                    # Yield one massive, contiguous block of uint8 memory to the main thread
+                    yield (
+                        torch.stack(batch_v),
+                        torch.stack(batch_p),
+                        torch.stack(batch_c),
+                        torch.stack(batch_d)
+                    )
+                    batch_v, batch_p, batch_c, batch_d = [], [], [], []
+            
+            # 🔥 Force garbage collection to ensure RAM is freed before loading next chunk
+            del vision_list, prop_list, cmd_list, done_list
+            gc.collect()
 
 # -----------------------------------------
 # 2. EBM JEPA Architecture
 # -----------------------------------------
 class VisionEncoder(nn.Module):
-    """Compresses the 64x64 optical flow camera stream."""
     def __init__(self, feature_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -89,7 +147,6 @@ class VisionEncoder(nn.Module):
         return self.net(x)
 
 class ProprioEncoder(nn.Module):
-    """Compresses joint angles and IMU data."""
     def __init__(self, input_dim: int = 47, feature_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -102,7 +159,6 @@ class ProprioEncoder(nn.Module):
         return self.net(x)
 
 class JointEncoder(nn.Module):
-    """Fuses modalities into the abstract state variable z_t."""
     def __init__(self, latent_dim: int = 256):
         super().__init__()
         self.vis_enc = VisionEncoder(feature_dim=128)
@@ -118,7 +174,6 @@ class JointEncoder(nn.Module):
         return self.fusion(torch.cat([v_feat, p_feat], dim=-1))
 
 class LatentPredictor(nn.Module):
-    """Predicts future states using a recurrent memory of momentum (GRU)."""
     def __init__(self, latent_dim: int = 256, cmd_dim: int = 3):
         super().__init__()
         self.input_proj = nn.Sequential(
@@ -137,7 +192,6 @@ class LatentPredictor(nn.Module):
         return self.output_proj(h_next), h_next
 
 class EBM_TinyQuadJEPA(nn.Module):
-    """The overarching Energy-Based Model using VICReg geometry."""
     def __init__(self, latent_dim: int = 256):
         super().__init__()
         self.latent_dim = latent_dim
@@ -150,15 +204,12 @@ class EBM_TinyQuadJEPA(nn.Module):
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
     def vicreg_loss(self, z_pred: torch.Tensor, z_target: torch.Tensor):
-        # 1. INVARIANCE: Push predictions and reality together
         sim_loss = F.mse_loss(z_pred, z_target)
         
-        # 2. VARIANCE: Force batch embeddings to spread out (prevent point collapse)
         std_target = torch.sqrt(z_target.var(dim=0) + 1e-04)
         std_pred = torch.sqrt(z_pred.var(dim=0) + 1e-04)
         var_loss = torch.mean(F.relu(1 - std_target)) + torch.mean(F.relu(1 - std_pred))
 
-        # 3. COVARIANCE: Decorrelate dimensions (prevent informational collapse)
         z_target_centered = z_target - z_target.mean(dim=0)
         z_pred_centered = z_pred - z_pred.mean(dim=0)
         batch_size = z_target.shape[0]
@@ -169,7 +220,6 @@ class EBM_TinyQuadJEPA(nn.Module):
         cov_loss = self.off_diagonal(cov_target).pow_(2).sum() / self.latent_dim + \
                    self.off_diagonal(cov_pred).pow_(2).sum() / self.latent_dim
 
-        # Standard VICReg hyperparameters
         sim_weight, var_weight, cov_weight = 25.0, 25.0, 1.0
         total_loss = (sim_weight * sim_loss) + (var_weight * var_loss) + (cov_weight * cov_loss)
         
@@ -190,82 +240,84 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Initializing EBM JEPA Training on {device}...")
 
-    # Data Loading Strategy
-    dataset = JEPADataset(data_dir="jepa_final_dataset", seq_len=16)
+    global_batch_size = 2048
+    dataset = StreamingJEPADataset(data_dir="jepa_final_dataset", seq_len=16, envs_per_chunk=64, global_batch_size=global_batch_size)
+    
+    total_batches = 4925 
+    
     dataloader = DataLoader(
         dataset, 
-        batch_size=256,       # High batch size for geometric variance calculations
-        shuffle=True, 
-        num_workers=8,        # Feed the GPU fast enough to prevent idling
-        pin_memory=True,      # Lock memory pages for faster CPU->GPU transfer
-        prefetch_factor=2, 
-        drop_last=True
+        batch_size=None,      # 🔥 Set to None: The Dataset yields complete batches natively
+        num_workers=12,       
+        pin_memory=True,      
+        prefetch_factor=2,
     )
 
     model = EBM_TinyQuadJEPA().to(device)
     
-    # Optimizer & Scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    if hasattr(torch, 'compile'):
+        print("⚙️ Compiling model into optimized GPU assembly (this will hang for ~1 minute on startup)...")
+        model = torch.compile(model)
+        
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-5)
     epochs = 20
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    scaler = GradScaler('cuda')
     
     os.makedirs("jepa_checkpoints", exist_ok=True)
 
     for epoch in range(epochs):
         model.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        pbar = tqdm(dataloader, total=total_batches, desc=f"Epoch {epoch+1}/{epochs}")
         
         total_epoch_loss = 0
         
         for batch_idx, (vis, prop, cmds, dones) in enumerate(pbar):
-            # Move data sequence to GPU
-            vis = vis.to(device, non_blocking=True)
+            # 🔥 Late GPU Casting: Convert uint8 to float32 only once it hits the VRAM
+            vis = vis.to(device, non_blocking=True).float() / 255.0
             prop = prop.to(device, non_blocking=True)
             cmds = cmds.to(device, non_blocking=True)
             
-            batch_size, seq_len = vis.shape[0], vis.shape[1]
-
-            # Initialize working memory for the GRU
-            h_t = torch.zeros(batch_size, 256, device=device)
+            h_t = torch.zeros(global_batch_size, 256, device=device)
             seq_loss = 0
             sim_avg, var_avg, cov_avg = 0, 0, 0
 
-            # Unroll the sequence
-            for t in range(seq_len - 1):
-                loss, h_t, metrics = model.forward_step(
-                    vis[:, t], prop[:, t], cmds[:, t],
-                    vis[:, t+1], prop[:, t+1], h_t
-                )
-                
-                # Prevent backprop across episode resets (if robot fell over)
-                reset_mask = dones[:, t+1].float().to(device)
-                loss = loss * (1.0 - reset_mask).mean()
-                
-                seq_loss += loss
-                sim_avg += metrics[0]; var_avg += metrics[1]; cov_avg += metrics[2]
-
-            # Average loss over the temporal steps
-            seq_loss = seq_loss / (seq_len - 1)
-            
             optimizer.zero_grad(set_to_none=True)
-            seq_loss.backward()
+
+            with autocast('cuda', dtype=torch.bfloat16):
+                for t in range(15):
+                    loss, h_t, metrics = model.forward_step(
+                        vis[:, t], prop[:, t], cmds[:, t],
+                        vis[:, t+1], prop[:, t+1], h_t
+                    )
+                    
+                    reset_mask = dones[:, t+1].float().to(device)
+                    loss = loss * (1.0 - reset_mask).mean()
+                    
+                    seq_loss += loss
+                    sim_avg += metrics[0]; var_avg += metrics[1]; cov_avg += metrics[2]
+
+                seq_loss = seq_loss / 15
             
-            # Clip exploding RNN gradients
+            scaler.scale(seq_loss).backward()
+            
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            
+            scaler.step(optimizer)
+            scaler.update()
 
             total_epoch_loss += seq_loss.item()
             
-            # Update telemetry
             if batch_idx % 5 == 0:
                 pbar.set_postfix({
                     "Energy": f"{seq_loss.item():.2f}",
-                    "Sim": f"{sim_avg/(seq_len-1):.3f}",
-                    "Var": f"{var_avg/(seq_len-1):.3f}",
+                    "Sim": f"{sim_avg/15:.3f}",
+                    "Var": f"{var_avg/15:.3f}",
                     "LR": f"{scheduler.get_last_lr()[0]:.1e}"
                 })
 
-        # End of Epoch
         scheduler.step()
         avg_loss = total_epoch_loss / len(dataloader)
         print(f"🏁 Epoch {epoch+1} Complete | Avg Energy: {avg_loss:.4f}")

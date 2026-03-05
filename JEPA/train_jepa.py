@@ -2,6 +2,7 @@
 """
 System 2 EBM JEPA Training Loop (VICReg Formulation)
 Optimized with AMP, PyTorch Compiler, Worker-Side Batching, and Late GPU Casting.
+Includes CSV Logging, 5-Batch Sanity Check, and Mandatory Intra-Epoch Checkpointing.
 
 Usage:
     python JEPA/train_jepa.py
@@ -11,6 +12,7 @@ import glob
 import random
 import h5py
 import gc
+import csv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,14 +58,12 @@ class StreamingJEPADataset(IterableDataset):
             my_envs = self.global_envs
             seed = 0
         else:
-            # Distribute environments evenly across active workers
             my_envs = self.global_envs[worker_info.id :: worker_info.num_workers]
             seed = worker_info.id
 
         rng = random.Random(seed)
         rng.shuffle(my_envs)
         
-        # The worker builds the entire batch itself to bypass PyTorch collation overhead
         batch_v, batch_p, batch_c, batch_d = [], [], [], []
 
         for i in range(0, len(my_envs), self.envs_per_chunk):
@@ -84,7 +84,6 @@ class StreamingJEPADataset(IterableDataset):
                     d = h5f['dones'][indices]
                     
                     for local_idx in range(len(indices)):
-                        # 🔥 Loaded as strict uint8/float32 to minimize RAM footprint
                         vision_list.append(torch.from_numpy(v[local_idx])) 
                         prop_list.append(torch.from_numpy(p[local_idx]).float())
                         cmd_list.append(torch.from_numpy(c[local_idx]).float())
@@ -101,7 +100,6 @@ class StreamingJEPADataset(IterableDataset):
 
             rng.shuffle(sequences)
 
-            # 🔥 Worker-Side Batching
             for e_idx, start_t in sequences:
                 end_t = start_t + self.seq_len
                 
@@ -111,7 +109,6 @@ class StreamingJEPADataset(IterableDataset):
                 batch_d.append(done_list[e_idx][start_t:end_t])
                 
                 if len(batch_v) == self.global_batch_size:
-                    # Yield one massive, contiguous block of uint8 memory to the main thread
                     yield (
                         torch.stack(batch_v),
                         torch.stack(batch_p),
@@ -120,7 +117,6 @@ class StreamingJEPADataset(IterableDataset):
                     )
                     batch_v, batch_p, batch_c, batch_d = [], [], [], []
             
-            # 🔥 Force garbage collection to ensure RAM is freed before loading next chunk
             del vision_list, prop_list, cmd_list, done_list
             gc.collect()
 
@@ -247,7 +243,7 @@ def train():
     
     dataloader = DataLoader(
         dataset, 
-        batch_size=None,      # 🔥 Set to None: The Dataset yields complete batches natively
+        batch_size=None,      
         num_workers=12,       
         pin_memory=True,      
         prefetch_factor=2,
@@ -265,7 +261,20 @@ def train():
     
     scaler = GradScaler('cuda')
     
+    # Setup directories
     os.makedirs("jepa_checkpoints", exist_ok=True)
+    os.makedirs("jepa_logs", exist_ok=True)
+    
+    # 🔥 Initialize CSV Logger
+    csv_path = "jepa_logs/training_metrics.csv"
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["Epoch", "Batch", "Global_Step", "Total_Energy", "Sim", "Var", "Cov", "LR"])
+    
+    save_interval = 1000 
+    global_step = 0
 
     for epoch in range(epochs):
         model.train()
@@ -274,7 +283,6 @@ def train():
         total_epoch_loss = 0
         
         for batch_idx, (vis, prop, cmds, dones) in enumerate(pbar):
-            # 🔥 Late GPU Casting: Convert uint8 to float32 only once it hits the VRAM
             vis = vis.to(device, non_blocking=True).float() / 255.0
             prop = prop.to(device, non_blocking=True)
             cmds = cmds.to(device, non_blocking=True)
@@ -301,25 +309,59 @@ def train():
                 seq_loss = seq_loss / 15
             
             scaler.scale(seq_loss).backward()
-            
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             scaler.step(optimizer)
             scaler.update()
 
             total_epoch_loss += seq_loss.item()
             
+            # Calculate step averages
+            current_lr = scheduler.get_last_lr()[0]
+            s_avg, v_avg, c_avg = sim_avg/15, var_avg/15, cov_avg/15
+            
+            # 🔥 Log to CSV every single batch
+            with open(csv_path, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([epoch+1, batch_idx+1, global_step+1, seq_loss.item(), s_avg, v_avg, c_avg, current_lr])
+            
             if batch_idx % 5 == 0:
                 pbar.set_postfix({
                     "Energy": f"{seq_loss.item():.2f}",
-                    "Sim": f"{sim_avg/15:.3f}",
-                    "Var": f"{var_avg/15:.3f}",
-                    "LR": f"{scheduler.get_last_lr()[0]:.1e}"
+                    "Sim": f"{s_avg:.3f}",
+                    "Var": f"{v_avg:.3f}",
+                    "LR": f"{current_lr:.1e}"
                 })
+                
+            # 🔥 5-Batch Sanity Check (Triggers at exactly batch 5)
+            if batch_idx == 4:
+                torch.save({
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': seq_loss.item(),
+                }, "jepa_checkpoints/jepa_sanity_check_batch_5.pt")
+                print("\n✅ Sanity check passed: 5-batch checkpoint written to drive successfully.")
+
+            # Standard safety checkpoint
+            if (batch_idx + 1) % save_interval == 0:
+                step_loss = total_epoch_loss / (batch_idx + 1)
+                torch.save({
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': step_loss,
+                }, f"jepa_checkpoints/jepa_epoch_{epoch+1}_step_{batch_idx+1}.pt")
+                print(f"\n💾 Safety checkpoint saved at step {batch_idx+1}")
+                
+            global_step += 1
 
         scheduler.step()
-        avg_loss = total_epoch_loss / len(dataloader)
+        
+        # Safe length division using the fixed integer
+        avg_loss = total_epoch_loss / total_batches 
         print(f"🏁 Epoch {epoch+1} Complete | Avg Energy: {avg_loss:.4f}")
         
         torch.save({

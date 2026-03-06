@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 System 1 + System 2 EBM JEPA - Genesis Simulator Evaluation
-Zero-Shot "Teleport" Sanity Check: Can the JEPA seek a physical goal?
+Zero-Shot "Teleport" Sanity Check with Cost Telemetry
 
 Usage:
     python JEPA/6_genesis_eval.py \
@@ -181,7 +181,6 @@ def init_genesis_scene(device):
     plane = scene.add_entity(gs.morphs.Plane()) 
     
     # --- VISUAL LANDMARKS ---
-    # Scattering unmovable 3D blocks to create visual parallax and break spatial aliasing
     scene.add_entity(gs.morphs.Box(pos=(0.5, 0.4, 0.075), size=(0.15, 0.15, 0.15), fixed=True))
     scene.add_entity(gs.morphs.Box(pos=(0.9, -0.3, 0.05), size=(0.1, 0.2, 0.1), fixed=True))
     scene.add_entity(gs.morphs.Box(pos=(1.3, 0.2, 0.1), size=(0.2, 0.1, 0.2), fixed=True))
@@ -383,12 +382,14 @@ def main():
                 
                 for t in range(args.horizon):
                     z_pred, h_t = jepa.predictor(z_pred, candidate_cmds[:, t], h_t)
-                    
-                    # Cost is purely the distance to the goal we captured via teleportation
                     total_cost += torch.norm(z_pred - z_goal, dim=-1)
 
                 best_idx = torch.argmin(total_cost)
                 best_cmd = candidate_cmds[best_idx][0].unsqueeze(0) 
+                
+                # --- COST TELEMETRY ---
+                min_cost = total_cost[best_idx].item()
+                max_cost = torch.max(total_cost).item()
 
             # --- SYSTEM 1: PPO EXECUTES ---
             with torch.no_grad():
@@ -405,7 +406,7 @@ def main():
                 scene.step()
 
             hz = 1.0 / (time.perf_counter() - loop_start)
-            print(f"\r⚡ Sim Step: {step_count+1}/{args.steps} | Freq: {hz:5.1f} Hz | Cmd: [{best_cmd[0,0]:+.2f}, {best_cmd[0,1]:+.2f}, {best_cmd[0,2]:+.2f}]", end="")
+            print(f"\r⚡ Sim Step: {step_count+1}/{args.steps} | Freq: {hz:5.1f} Hz | Cmd: [{best_cmd[0,0]:+.2f}, {best_cmd[0,1]:+.2f}, {best_cmd[0,2]:+.2f}] | Cost: {min_cost:.1f} (max: {max_cost:.1f})", end="")
 
     except KeyboardInterrupt:
         print("\n\n🛑 Simulation interrupted.")

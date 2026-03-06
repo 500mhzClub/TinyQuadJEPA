@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 System 1 + System 2 EBM JEPA - Genesis Simulator Evaluation
-Runs the MPC loop using JEPA for navigation and PPO for low-level motor control.
+Zero-Shot "Teleport" Sanity Check: Can the JEPA seek a physical goal?
 
 Usage:
     python JEPA/6_genesis_eval.py \
@@ -266,6 +266,22 @@ def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
     obs = torch.cat([z, quat, vel_b, ang_b, q_rel, dq, prev_action, cmd], dim=1)
     return obs
 
+def move_cameras(robot, cam_brain, cam_render):
+    """Helper to keep cameras locked on the robot."""
+    r_pos = robot.get_pos().cpu().numpy()
+    if r_pos.ndim > 1: r_pos = r_pos[0]
+    
+    c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
+    
+    for cam in [cam_brain, cam_render]:
+        try:
+            cam.set_pose(pos=c_pos, lookat=r_pos, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        except TypeError:
+            try:
+                cam.set_pose(pos=c_pos, lookat=r_pos, up_vector=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+            except TypeError:
+                cam.set_pose(pos=c_pos, lookat=r_pos)
+
 # -----------------------------------------
 # 4. Main Loop
 # -----------------------------------------
@@ -274,7 +290,7 @@ def main():
     parser.add_argument("--jepa_ckpt", type=str, required=True, help="Path to JEPA (System 2)")
     parser.add_argument("--ppo_ckpt", type=str, required=True, help="Path to PPO (System 1)")
     parser.add_argument("--candidates", type=int, default=100)
-    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--horizon", type=int, default=15)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--out", type=str, default="eval_output.mp4")
     parser.add_argument("--device", type=str, default="cpu")
@@ -295,31 +311,50 @@ def main():
     print(f"✅ Both checkpoints loaded successfully!")
 
     scene, robot, cam_brain, cam_render, act_dofs, q0 = init_genesis_scene(device)
+    q0_np = q0.cpu().numpy()
+
+    # Let physics settle
+    for _ in range(10): scene.step()
+
+    print("🎯 Teleporting 1.0m forward to capture zero-shot goal state...")
+    target_pos = np.array([1.0, 0.0, 0.12], dtype=np.float32)
+    
+    try:
+        robot.set_pos(target_pos)
+    except Exception as e:
+        print(f"⚠️ Warning: set_pos failed ({e}). Re-spawning entity...")
+
+    for _ in range(5): scene.step() # Ensure visualizer updates
+    move_cameras(robot, cam_brain, cam_render)
+
+    vis_goal, prop_goal = get_jepa_state(robot, cam_brain, device)
+    with torch.no_grad():
+        z_goal = jepa.encoder(vis_goal, prop_goal).detach()
+
+    print("⏪ Teleporting back to origin to begin test...")
+    start_pos = np.array([0.0, 0.0, 0.12], dtype=np.float32)
+    try:
+        robot.set_pos(start_pos)
+        robot.set_dofs_position(q0_np, act_dofs)
+        robot.set_vel(np.zeros(3, dtype=np.float32))
+        robot.set_ang(np.zeros(3, dtype=np.float32))
+    except Exception:
+        pass
+        
+    for _ in range(10): scene.step()
+    move_cameras(robot, cam_brain, cam_render)
+    
     cam_render.start_recording() 
 
     prev_action = torch.zeros((1, 12), device=device)
     action_scale = 0.30 
 
-    print(f"\n🐕 Running integrated MPC (System 2 -> System 1). Recording {args.steps} steps...\n")
+    print(f"\n🐕 Running Zero-Shot Latent Seek (System 2 -> System 1). Recording {args.steps} steps...\n")
     
     try:
         for step_count in range(args.steps):
             loop_start = time.perf_counter()
-
-            # --- CAMERA TRACKING ---
-            r_pos = robot.get_pos().cpu().numpy()
-            if r_pos.ndim > 1: r_pos = r_pos[0]
-            
-            c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
-            
-            for cam in [cam_brain, cam_render]:
-                try:
-                    cam.set_pose(pos=c_pos, lookat=r_pos, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
-                except TypeError:
-                    try:
-                        cam.set_pose(pos=c_pos, lookat=r_pos, up_vector=np.array([0.0, 0.0, 1.0], dtype=np.float32))
-                    except TypeError:
-                        cam.set_pose(pos=c_pos, lookat=r_pos)
+            move_cameras(robot, cam_brain, cam_render)
 
             # --- SYSTEM 2: JEPA THINKS ---
             with torch.no_grad():
@@ -341,10 +376,8 @@ def main():
                 for t in range(args.horizon):
                     z_pred, h_t = jepa.predictor(z_pred, candidate_cmds[:, t], h_t)
                     
-                    # NOTE: Removed the visual/proprioceptive anchor!
-                    # The MPC is now purely chasing the highest forward velocity command.
-                    forward_reward = candidate_cmds[:, t, 0] 
-                    total_cost -= forward_reward 
+                    # Cost is purely the distance to the goal we captured via teleportation
+                    total_cost += torch.norm(z_pred - z_goal, dim=-1)
 
                 best_idx = torch.argmin(total_cost)
                 best_cmd = candidate_cmds[best_idx][0].unsqueeze(0) 
@@ -356,7 +389,6 @@ def main():
                 prev_action = action.clone()
 
                 q_tgt = q0.unsqueeze(0) + action_scale * action
-                
                 q_tgt_gs = q_tgt[0].detach().to(gs.device)
                 robot.control_dofs_position(q_tgt_gs, act_dofs)
 

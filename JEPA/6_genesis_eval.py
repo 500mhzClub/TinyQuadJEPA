@@ -180,6 +180,14 @@ def init_genesis_scene(device):
     scene = gs.Scene(show_viewer=False) 
     plane = scene.add_entity(gs.morphs.Plane()) 
     
+    # --- VISUAL LANDMARKS ---
+    # Scattering unmovable 3D blocks to create visual parallax and break spatial aliasing
+    scene.add_entity(gs.morphs.Box(pos=(0.5, 0.4, 0.075), size=(0.15, 0.15, 0.15), fixed=True))
+    scene.add_entity(gs.morphs.Box(pos=(0.9, -0.3, 0.05), size=(0.1, 0.2, 0.1), fixed=True))
+    scene.add_entity(gs.morphs.Box(pos=(1.3, 0.2, 0.1), size=(0.2, 0.1, 0.2), fixed=True))
+    scene.add_entity(gs.morphs.Box(pos=(0.2, -0.5, 0.06), size=(0.12, 0.12, 0.12), fixed=True))
+    # ------------------------
+
     robot = scene.add_entity(
         gs.morphs.URDF(
             file="assets/mini_pupper/mini_pupper.urdf",

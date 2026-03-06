@@ -206,11 +206,9 @@ def init_genesis_scene(device):
     ]
     dofs_idx = [robot.get_joint(name).dofs_idx_local[0] for name in actuated_joints]
     
-    # Init position
     q0 = np.array([0.06, 0.06, -0.06, -0.06, 0.85, 0.85, 0.85, 0.85, -1.75, -1.75, -1.75, -1.75], dtype=np.float32)
     robot.set_dofs_position(q0, dofs_idx)
 
-    # PID values exactly like train_blind.py
     robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs_idx)
     robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs_idx)
 
@@ -241,7 +239,6 @@ def get_jepa_state(robot, cam_brain, device):
     return vis_tensor.unsqueeze(0), prop_tensor.unsqueeze(0)
 
 def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
-    """Builds the exact 50D tensor that PPO expects, and forces EVERYTHING to the right device."""
     pos = robot.get_pos().to(device)
     if pos.dim() == 1: pos = pos.unsqueeze(0)
         
@@ -266,7 +263,6 @@ def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
     z = pos[:, 2:3]
     q_rel = q - q0.unsqueeze(0)
 
-    # obs = [z(1), quat(4), vel_b(3), ang_b(3), q_rel(12), dq(12), prev_action(12), cmd(3)] = 50
     obs = torch.cat([z, quat, vel_b, ang_b, q_rel, dq, prev_action, cmd], dim=1)
     return obs
 
@@ -287,13 +283,11 @@ def main():
     device = torch.device(args.device)
     print(f"🚀 Loading brains into Genesis on {device}...")
 
-    # Load System 2 (JEPA)
     jepa = EBM_TinyQuadJEPA().to(device)
     jepa_ckpt = torch.load(args.jepa_ckpt, map_location=device, weights_only=True)
     jepa.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in jepa_ckpt['model_state_dict'].items()})
     jepa.eval()
     
-    # Load System 1 (PPO)
     ppo = ActorCritic(obs_dim=50, act_dim=12).to(device)
     ppo_ckpt = torch.load(args.ppo_ckpt, map_location=device)
     ppo.load_state_dict(ppo_ckpt['model'])
@@ -306,11 +300,6 @@ def main():
     prev_action = torch.zeros((1, 12), device=device)
     action_scale = 0.30 
 
-    # --- Capture the "Safe" Latent State ---
-    vis_init, prop_init = get_jepa_state(robot, cam_brain, device)
-    with torch.no_grad():
-        z_safe_goal = jepa.encoder(vis_init, prop_init).detach()
-
     print(f"\n🐕 Running integrated MPC (System 2 -> System 1). Recording {args.steps} steps...\n")
     
     try:
@@ -321,7 +310,6 @@ def main():
             r_pos = robot.get_pos().cpu().numpy()
             if r_pos.ndim > 1: r_pos = r_pos[0]
             
-            # Maintain the relative offset (0.8, -0.8, 0.33 height offset)
             c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
             
             for cam in [cam_brain, cam_render]:
@@ -342,11 +330,10 @@ def main():
                 z_batch = z_current.expand(args.candidates, -1)
                 h_t = torch.zeros(args.candidates, 256, device=device)
                 
-                # Constrain JEPA commands (vx, vy, omega) for Mini Pupper
                 candidate_cmds = (torch.rand((args.candidates, args.horizon, 3), device=device) * 2.0) - 1.0
-                candidate_cmds[:, :, 0] *= 0.60 # max vx
-                candidate_cmds[:, :, 1] *= 0.30 # max vy
-                candidate_cmds[:, :, 2] *= 0.80 # max omega
+                candidate_cmds[:, :, 0] *= 0.60 
+                candidate_cmds[:, :, 1] *= 0.30 
+                candidate_cmds[:, :, 2] *= 0.80 
                 
                 total_cost = torch.zeros(args.candidates, device=device)
                 z_pred = z_batch
@@ -354,16 +341,13 @@ def main():
                 for t in range(args.horizon):
                     z_pred, h_t = jepa.predictor(z_pred, candidate_cmds[:, t], h_t)
                     
-                    # 1. State Cost: Penalize diverging from the initial safe standing state
-                    state_cost = torch.norm(z_pred - z_safe_goal, dim=-1)
-                    
-                    # 2. Action Reward: Encourage forward velocity so it doesn't just stand still
-                    forward_reward = 5.0 * candidate_cmds[:, t, 0] 
-                    
-                    total_cost += (state_cost - forward_reward)
+                    # NOTE: Removed the visual/proprioceptive anchor!
+                    # The MPC is now purely chasing the highest forward velocity command.
+                    forward_reward = candidate_cmds[:, t, 0] 
+                    total_cost -= forward_reward 
 
                 best_idx = torch.argmin(total_cost)
-                best_cmd = candidate_cmds[best_idx][0].unsqueeze(0) # [1, 3]
+                best_cmd = candidate_cmds[best_idx][0].unsqueeze(0) 
 
             # --- SYSTEM 1: PPO EXECUTES ---
             with torch.no_grad():
@@ -371,7 +355,6 @@ def main():
                 action = ppo.act_deterministic(sys1_obs)
                 prev_action = action.clone()
 
-                # Convert PPO actions to joint angles
                 q_tgt = q0.unsqueeze(0) + action_scale * action
                 
                 q_tgt_gs = q_tgt[0].detach().to(gs.device)

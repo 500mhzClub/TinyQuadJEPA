@@ -306,11 +306,32 @@ def main():
     prev_action = torch.zeros((1, 12), device=device)
     action_scale = 0.30 
 
+    # --- Capture the "Safe" Latent State ---
+    vis_init, prop_init = get_jepa_state(robot, cam_brain, device)
+    with torch.no_grad():
+        z_safe_goal = jepa.encoder(vis_init, prop_init).detach()
+
     print(f"\n🐕 Running integrated MPC (System 2 -> System 1). Recording {args.steps} steps...\n")
     
     try:
         for step_count in range(args.steps):
             loop_start = time.perf_counter()
+
+            # --- CAMERA TRACKING ---
+            r_pos = robot.get_pos().cpu().numpy()
+            if r_pos.ndim > 1: r_pos = r_pos[0]
+            
+            # Maintain the relative offset (0.8, -0.8, 0.33 height offset)
+            c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
+            
+            for cam in [cam_brain, cam_render]:
+                try:
+                    cam.set_pose(pos=c_pos, lookat=r_pos, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+                except TypeError:
+                    try:
+                        cam.set_pose(pos=c_pos, lookat=r_pos, up_vector=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+                    except TypeError:
+                        cam.set_pose(pos=c_pos, lookat=r_pos)
 
             # --- SYSTEM 2: JEPA THINKS ---
             with torch.no_grad():
@@ -327,13 +348,21 @@ def main():
                 candidate_cmds[:, :, 1] *= 0.30 # max vy
                 candidate_cmds[:, :, 2] *= 0.80 # max omega
                 
-                total_energy = torch.zeros(args.candidates, device=device)
+                total_cost = torch.zeros(args.candidates, device=device)
                 z_pred = z_batch
+                
                 for t in range(args.horizon):
                     z_pred, h_t = jepa.predictor(z_pred, candidate_cmds[:, t], h_t)
-                    total_energy += torch.norm(z_pred, dim=-1)
+                    
+                    # 1. State Cost: Penalize diverging from the initial safe standing state
+                    state_cost = torch.norm(z_pred - z_safe_goal, dim=-1)
+                    
+                    # 2. Action Reward: Encourage forward velocity so it doesn't just stand still
+                    forward_reward = 5.0 * candidate_cmds[:, t, 0] 
+                    
+                    total_cost += (state_cost - forward_reward)
 
-                best_idx = torch.argmin(total_energy)
+                best_idx = torch.argmin(total_cost)
                 best_cmd = candidate_cmds[best_idx][0].unsqueeze(0) # [1, 3]
 
             # --- SYSTEM 1: PPO EXECUTES ---
@@ -345,12 +374,10 @@ def main():
                 # Convert PPO actions to joint angles
                 q_tgt = q0.unsqueeze(0) + action_scale * action
                 
-                # Force it into Genesis device format to be safe
                 q_tgt_gs = q_tgt[0].detach().to(gs.device)
                 robot.control_dofs_position(q_tgt_gs, act_dofs)
 
             # --- PHYSICS ENGINE ---
-            # decimation = 4 from your config
             for _ in range(4):
                 scene.step()
 

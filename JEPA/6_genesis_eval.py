@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 System 1 + System 2 EBM JEPA - Genesis Simulator Evaluation
-Zero-Shot "Teleport" Sanity Check with Cost Telemetry
+Demonstration Test: Can the JEPA seek a physically recorded goal state?
 
 Usage:
     python JEPA/6_genesis_eval.py \
-        --jepa_ckpt jepa_checkpoints/jepa_epoch_2.pt \
+        --jepa_ckpt jepa_checkpoints/jepa_epoch_4_step_3000.pt \
         --ppo_ckpt runs/pupper_omni_20260225_150134/ckpt_20000.pt \
         --device cpu
 """
@@ -319,26 +319,53 @@ def main():
 
     scene, robot, cam_brain, cam_render, act_dofs, q0 = init_genesis_scene(device)
     q0_np = q0.cpu().numpy()
+    action_scale = 0.30 
 
     # Let physics settle
     for _ in range(10): scene.step()
-
-    print("🎯 Teleporting 1.0m forward to capture zero-shot goal state...")
-    target_pos = np.array([1.0, 0.0, 0.12], dtype=np.float32)
-    
-    try:
-        robot.set_pos(target_pos)
-    except Exception as e:
-        print(f"⚠️ Warning: set_pos failed ({e}). Re-spawning entity...")
-
-    for _ in range(5): scene.step() # Ensure visualizer updates
     move_cameras(robot, cam_brain, cam_render)
 
+    # -------------------------------------------------------------
+    # DEMONSTRATION PHASE: Physically drive to the goal
+    # -------------------------------------------------------------
+    print("\n🎬 Recording a physically valid forward demonstration...")
+    demo_cmd = torch.tensor([[0.50, 0.0, 0.0]], device=device) # Hardcoded forward sprint
+    prev_action_demo = torch.zeros((1, 12), device=device)
+    
+    for demo_step in range(45): # Approx 1.5 seconds of walking
+        sys1_obs = get_system1_obs(robot, q0, prev_action_demo, demo_cmd, act_dofs, device)
+        with torch.no_grad():
+            action = ppo.act_deterministic(sys1_obs)
+            
+        prev_action_demo = action.clone()
+        q_tgt = q0.unsqueeze(0) + action_scale * action
+        q_tgt_gs = q_tgt[0].detach().to(gs.device)
+        robot.control_dofs_position(q_tgt_gs, act_dofs)
+        
+        for _ in range(4): 
+            scene.step()
+        move_cameras(robot, cam_brain, cam_render)
+        
+        # Simple progress bar
+        print(f"\rDriving forward... {demo_step+1}/45", end="")
+
+    # Settle at the goal location
+    for _ in range(10): scene.step()
+    move_cameras(robot, cam_brain, cam_render)
+
+    # Capture the true physical goal state
     vis_goal, prop_goal = get_jepa_state(robot, cam_brain, device)
     with torch.no_grad():
         z_goal = jepa.encoder(vis_goal, prop_goal).detach()
+    
+    final_pos = robot.get_pos().cpu().numpy()
+    if final_pos.ndim > 1: final_pos = final_pos[0]
+    print(f"\n✅ Captured true physical z_goal at position x={final_pos[0]:.2f}!")
 
-    print("⏪ Teleporting back to origin to begin test...")
+    # -------------------------------------------------------------
+    # RESET PHASE
+    # -------------------------------------------------------------
+    print("⏪ Resetting to origin to begin MPC test...")
     start_pos = np.array([0.0, 0.0, 0.12], dtype=np.float32)
     try:
         robot.set_pos(start_pos)
@@ -348,16 +375,17 @@ def main():
     except Exception:
         pass
         
-    for _ in range(10): scene.step()
+    for _ in range(20): scene.step()
     move_cameras(robot, cam_brain, cam_render)
     
     cam_render.start_recording() 
-
     prev_action = torch.zeros((1, 12), device=device)
-    action_scale = 0.30 
 
     print(f"\n🐕 Running Zero-Shot Latent Seek (System 2 -> System 1). Recording {args.steps} steps...\n")
     
+    # -------------------------------------------------------------
+    # EVALUATION PHASE
+    # -------------------------------------------------------------
     try:
         for step_count in range(args.steps):
             loop_start = time.perf_counter()

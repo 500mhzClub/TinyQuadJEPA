@@ -154,7 +154,7 @@ def get_jepa_state(robot, cam_brain, device):
         if img.shape[-1] == 3: # Convert to (C, H, W)
             img = np.transpose(img, (2, 0, 1))
             
-        # 🔥 THE FIX: .copy() forces numpy to allocate fresh, contiguous memory
+        # .copy() fixes PyTorch negative stride errors
         vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
     else:
         raise ValueError(f"Image extracted is not an array! Type: {type(img)}")
@@ -165,7 +165,6 @@ def get_jepa_state(robot, cam_brain, device):
     prop_array = np.zeros(47, dtype=np.float32)
     prop_array[:min(47, len(raw_prop))] = raw_prop[:min(47, len(raw_prop))]
     
-    # Adding .copy() here too just to be perfectly safe
     prop_tensor = torch.from_numpy(prop_array.copy()).float().to(device)
         
     return vis_tensor.unsqueeze(0), prop_tensor.unsqueeze(0)
@@ -218,8 +217,7 @@ def main():
     print("⏪ Resetting to origin to map energy landscape...")
     robot.set_pos(np.array([0.0, 0.0, 0.12], dtype=np.float32))
     robot.set_dofs_position(q0_np, act_dofs)
-    robot.set_vel(np.zeros(3, dtype=np.float32))
-    robot.set_ang(np.zeros(3, dtype=np.float32))
+    # Removed set_vel and set_ang; kinematics reset is handled by pos/dofs.
     for _ in range(10): scene.step()
     move_cameras(robot, cam_brain)
 

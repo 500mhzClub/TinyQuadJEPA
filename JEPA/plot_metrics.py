@@ -2,7 +2,7 @@
 """
 System 2 EBM JEPA Telemetry Visualizer.
 Reads the live CSV log file, renders a stacked metrics graph,
-and prints a summary table of the best metrics.
+and prints a summary table of the latest smoothed metrics.
 
 Usage:
     python JEPA/plot_metrics.py
@@ -38,17 +38,24 @@ def plot_metrics(csv_path="jepa_logs/training_metrics.csv"):
 
     print(f"📈 Plotting {len(steps)} data points...")
     
-    # --- Print Best Stats Table ---
-    print("\n" + "="*40)
-    print("🏆 CURRENT BEST TRAINING METRICS 🏆")
-    print("="*40)
-    print(f"| {'Metric':<15} | {'Best Value':<18} |")
-    print("-" * 40)
-    print(f"| {'Total Energy':<15} | {min(energy):<18.4f} |")
-    print(f"| {'Sim (MSE)':<15} | {min(sim):<18.4f} |")
-    print(f"| {'Var (Collapse)':<15} | {min(var):<18.4f} |")
-    print(f"| {'Cov (Tangle)':<15} | {min(cov):<18.4f} |")
-    print("="*40 + "\n")
+    # Calculate latest smoothed values (last 50 steps)
+    window = min(50, len(steps))
+    latest_energy = sum(energy[-window:]) / window
+    latest_sim = sum(sim[-window:]) / window
+    latest_var = sum(var[-window:]) / window
+    latest_cov = sum(cov[-window:]) / window
+
+    # --- Print Current Stats Table ---
+    print("\n" + "="*45)
+    print("🚀 CURRENT LIVE METRICS (50-Step Avg) 🚀")
+    print("="*45)
+    print(f"| {'Metric':<18} | {'Latest Value':<20} |")
+    print("-" * 45)
+    print(f"| {'Total Energy':<18} | {latest_energy:<20.4f} |")
+    print(f"| {'Sim (MSE)':<18} | {latest_sim:<20.4f} |")
+    print(f"| {'Var (Collapse)':<18} | {latest_var:<20.4f} |")
+    print(f"| {'Cov (Tangle)':<18} | {latest_cov:<20.4f} |")
+    print("="*45 + "\n")
     
     # Create a 4-panel stacked plot
     fig, axs = plt.subplots(4, 1, figsize=(12, 12), sharex=True)

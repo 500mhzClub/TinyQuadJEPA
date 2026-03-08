@@ -300,9 +300,9 @@ def main():
     ax.set_title(f"JEPA Energy Landscape (Epoch {epoch}, Step {batch_idx})", fontsize=14)
     ax.set_xlabel("Forward Velocity (vx)", fontsize=11, labelpad=10)
     ax.set_ylabel("Turn Rate (omega)", fontsize=11, labelpad=10)
-    ax.set_zlabel("Predicted Distance to Goal State", fontsize=11, labelpad=10)
+    ax.set_zlabel("Predicted Cost (Distance to Goal State)", fontsize=11, labelpad=10)
     
-    ax.invert_zaxis()
+    # Removed the inverted Z-axis so the landscape renders naturally as a bowl/sinkhole.
     
     fig.colorbar(surf, shrink=0.5, aspect=0.5, pad=0.1, label="Distance to Goal")
     plt.tight_layout()

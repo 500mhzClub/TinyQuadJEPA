@@ -222,26 +222,41 @@ def init_genesis_scene(device):
     return scene, robot, cam_brain, cam_render, dofs_idx, torch.tensor(q0, device=device)
 
 def get_jepa_state(robot, cam_brain, device):
-    cam_brain.render()
-    try:
-        img = cam_brain.get_image() if hasattr(cam_brain, 'get_image') else cam_brain.rgb
-        if isinstance(img, np.ndarray) and img.shape[-1] in [3, 4]:
-            img = img[:, :, :3] 
-            img = np.transpose(img, (2, 0, 1)) 
-            vis_tensor = torch.from_numpy(img).float().to(device) / 255.0
-        else:
-            vis_tensor = torch.zeros((3, 64, 64), device=device)
-    except Exception:
-        vis_tensor = torch.zeros((3, 64, 64), device=device)
+    # Genesis 0.3.14 returns the image buffers directly from render()
+    render_out = cam_brain.render()
+    
+    img = None
+    if isinstance(render_out, tuple) and len(render_out) > 0:
+        img = render_out[0] # rgb is usually the first buffer
+    elif isinstance(render_out, dict):
+        img = render_out.get('rgb', render_out.get('color'))
+    elif hasattr(render_out, 'shape'):
+        img = render_out
+        
+    if img is None:
+        raise RuntimeError(f"cam.render() returned unexpected type: {type(render_out)}")
 
-    try:
-        raw_prop = robot.get_dofs_position().cpu().numpy()
-        if raw_prop.ndim == 2: raw_prop = raw_prop[0] 
-        prop_array = np.zeros(47, dtype=np.float32)
-        prop_array[:min(47, len(raw_prop))] = raw_prop[:min(47, len(raw_prop))]
-        prop_tensor = torch.from_numpy(prop_array).float().to(device)
-    except Exception:
-        prop_tensor = torch.zeros(47, device=device)
+    if hasattr(img, 'cpu'):
+        img = img.cpu().numpy()
+
+    if isinstance(img, np.ndarray):
+        if img.shape[-1] == 4: # Strip alpha channel
+            img = img[:, :, :3]
+        if img.shape[-1] == 3: # Convert to (C, H, W)
+            img = np.transpose(img, (2, 0, 1))
+            
+        # .copy() fixes PyTorch negative stride errors
+        vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
+    else:
+        raise ValueError(f"Image extracted is not an array! Type: {type(img)}")
+
+    # Extract Proprioception
+    raw_prop = robot.get_dofs_position().cpu().numpy()
+    if raw_prop.ndim == 2: raw_prop = raw_prop[0] 
+    prop_array = np.zeros(47, dtype=np.float32)
+    prop_array[:min(47, len(raw_prop))] = raw_prop[:min(47, len(raw_prop))]
+    
+    prop_tensor = torch.from_numpy(prop_array.copy()).float().to(device)
         
     return vis_tensor.unsqueeze(0), prop_tensor.unsqueeze(0)
 

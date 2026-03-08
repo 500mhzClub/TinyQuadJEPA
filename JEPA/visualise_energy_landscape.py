@@ -15,7 +15,7 @@ from matplotlib import cm
 import genesis as gs
 
 # -----------------------------------------
-# JEPA Architecture (Copied for standalone execution)
+# JEPA Architecture
 # -----------------------------------------
 class VisionEncoder(nn.Module):
     def __init__(self, feature_dim: int = 128):
@@ -97,7 +97,6 @@ def init_genesis_scene(device):
     scene = gs.Scene(show_viewer=False) 
     plane = scene.add_entity(gs.morphs.Plane()) 
     
-    # Exact same visual landmarks from the eval script
     scene.add_entity(gs.morphs.Box(pos=(0.5, 0.4, 0.075), size=(0.15, 0.15, 0.15), fixed=True))
     scene.add_entity(gs.morphs.Box(pos=(0.9, -0.3, 0.05), size=(0.1, 0.2, 0.1), fixed=True))
     scene.add_entity(gs.morphs.Box(pos=(1.3, 0.2, 0.1), size=(0.2, 0.1, 0.2), fixed=True))
@@ -133,14 +132,48 @@ def init_genesis_scene(device):
 
 def get_jepa_state(robot, cam_brain, device):
     cam_brain.render()
-    img = cam_brain.get_image() if hasattr(cam_brain, 'get_image') else cam_brain.rgb
-    if isinstance(img, np.ndarray) and img.shape[-1] in [3, 4]:
-        img = img[:, :, :3] 
-        img = np.transpose(img, (2, 0, 1)) 
+    
+    # Robust Genesis Camera Extraction
+    img = None
+    extraction_methods = ['get_images', 'get_images_dict', 'render_rgb', 'get_rgba', 'get_color']
+    
+    for method in extraction_methods:
+        if hasattr(cam_brain, method):
+            result = getattr(cam_brain, method)()
+            # Handle if the method returns a dictionary of buffers (common in Genesis 0.3)
+            if isinstance(result, dict):
+                if 'rgb' in result: img = result['rgb']
+                elif 'color' in result: img = result['color']
+            elif isinstance(result, (np.ndarray, torch.Tensor)):
+                img = result
+            if img is not None:
+                break
+                
+    # Fallback to direct properties if methods fail
+    if img is None:
+        if hasattr(cam_brain, 'rgb'): img = cam_brain.rgb
+        elif hasattr(cam_brain, 'rgba'): img = cam_brain.rgba
+            
+    # Hard crash if we are still blind
+    if img is None:
+        print("\n🚨 CRITICAL CAMERA ERROR 🚨")
+        print(f"Could not extract image. Available camera attributes:\n{[m for m in dir(cam_brain) if not m.startswith('_')]}")
+        raise RuntimeError("JEPA is blind! Fix the camera extraction API above.")
+
+    # Convert PyTorch tensors to Numpy if needed
+    if hasattr(img, 'cpu'):
+        img = img.cpu().numpy()
+
+    # Format the image array for the VisionEncoder (C, H, W)
+    if isinstance(img, np.ndarray):
+        if img.shape[-1] == 4: # Strip alpha channel
+            img = img[:, :, :3]
+        img = np.transpose(img, (2, 0, 1))
         vis_tensor = torch.from_numpy(img).float().to(device) / 255.0
     else:
-        vis_tensor = torch.zeros((3, 64, 64), device=device)
+        raise ValueError(f"Image extracted is not an array! Type: {type(img)}")
 
+    # Extract Proprioception
     raw_prop = robot.get_dofs_position().cpu().numpy()
     if raw_prop.ndim == 2: raw_prop = raw_prop[0] 
     prop_array = np.zeros(47, dtype=np.float32)
@@ -238,7 +271,9 @@ def main():
     
     surf = ax.plot_surface(VX, OM, COSTS, cmap=cm.coolwarm, linewidth=0, antialiased=True, alpha=0.9)
     
-    ax.set_title(f"JEPA Energy Landscape (Step {ckpt['batch_idx']+1})", fontsize=14)
+    batch_idx = ckpt.get('batch_idx', 'Unknown')
+    epoch = ckpt.get('epoch', 'Unknown')
+    ax.set_title(f"JEPA Energy Landscape (Epoch {epoch}, Step {batch_idx})", fontsize=14)
     ax.set_xlabel("Forward Velocity (vx)", fontsize=11, labelpad=10)
     ax.set_ylabel("Turn Rate (omega)", fontsize=11, labelpad=10)
     ax.set_zlabel("Predicted Distance to Goal State", fontsize=11, labelpad=10)
@@ -249,7 +284,7 @@ def main():
     fig.colorbar(surf, shrink=0.5, aspect=0.5, pad=0.1, label="Distance to Goal")
     plt.tight_layout()
     
-    out_file = f"jepa_logs/energy_landscape_step_{ckpt['batch_idx']+1}.png"
+    out_file = f"jepa_logs/energy_landscape_epoch_{epoch}_step_{batch_idx}.png"
     plt.savefig(out_file, dpi=200)
     print(f"✅ Success! Energy landscape saved to {out_file}")
 

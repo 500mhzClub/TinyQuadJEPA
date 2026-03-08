@@ -89,8 +89,28 @@ class EBM_TinyQuadJEPA(nn.Module):
         self.predictor = LatentPredictor(latent_dim=latent_dim, cmd_dim=3)
 
 # -----------------------------------------
-# Simulator Helpers
+# Simulator Helpers & Math
 # -----------------------------------------
+def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
+    return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
+
+def quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    w = aw * bw - ax * bx - ay * by - az * bz
+    x = aw * bx + ax * bw + ay * bz - az * by
+    y = aw * by - ax * bz + ay * bw + az * bx
+    z = aw * bz + ax * by - ay * bx + az * bw
+    return torch.stack([w, x, y, z], dim=-1)
+
+def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros((v.shape[0], 1), device=v.device, dtype=v.dtype)
+    vq = torch.cat([zeros, v], dim=-1)
+    return quat_mul_wxyz(quat_mul_wxyz(q, vq), quat_conj_wxyz(q))[:, 1:4]
+
+def world_to_body_vec(quat_wxyz: torch.Tensor, vec_world: torch.Tensor) -> torch.Tensor:
+    return quat_rotate_wxyz(quat_conj_wxyz(quat_wxyz), vec_world)
+
 def init_genesis_scene(device):
     print("🌍 Booting Genesis Simulator (Headless CPU Mode)...")
     gs.init(backend=gs.cpu) 
@@ -130,13 +150,42 @@ def init_genesis_scene(device):
 
     return scene, robot, cam_brain, dofs_idx, torch.tensor(q0, device=device)
 
-def get_jepa_state(robot, cam_brain, device):
-    # Genesis 0.3.14 returns the image buffers directly from render()
+def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
+    """Calculates the full 50D kinematic state."""
+    pos = robot.get_pos().to(device)
+    if pos.dim() == 1: pos = pos.unsqueeze(0)
+        
+    quat = robot.get_quat().to(device)
+    if quat.dim() == 1: quat = quat.unsqueeze(0)
+        
+    vel_w = robot.get_vel().to(device)
+    if vel_w.dim() == 1: vel_w = vel_w.unsqueeze(0)
+        
+    ang_w = robot.get_ang().to(device)
+    if ang_w.dim() == 1: ang_w = ang_w.unsqueeze(0)
+
+    vel_b = world_to_body_vec(quat, vel_w)
+    ang_b = world_to_body_vec(quat, ang_w)
+
+    q = robot.get_dofs_position(act_dofs).to(device)
+    if q.dim() == 1: q = q.unsqueeze(0)
+        
+    dq = robot.get_dofs_velocity(act_dofs).to(device)
+    if dq.dim() == 1: dq = dq.unsqueeze(0)
+
+    z = pos[:, 2:3]
+    q_rel = q - q0.unsqueeze(0)
+
+    obs = torch.cat([z, quat, vel_b, ang_b, q_rel, dq, prev_action, cmd], dim=1)
+    return obs
+
+def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
+    """Extracts exactly what the JEPA saw during training (Vision + 47D Proprio)."""
     render_out = cam_brain.render()
     
     img = None
     if isinstance(render_out, tuple) and len(render_out) > 0:
-        img = render_out[0] # rgb is usually the first buffer
+        img = render_out[0] 
     elif isinstance(render_out, dict):
         img = render_out.get('rgb', render_out.get('color'))
     elif hasattr(render_out, 'shape'):
@@ -149,25 +198,21 @@ def get_jepa_state(robot, cam_brain, device):
         img = img.cpu().numpy()
 
     if isinstance(img, np.ndarray):
-        if img.shape[-1] == 4: # Strip alpha channel
+        if img.shape[-1] == 4: 
             img = img[:, :, :3]
-        if img.shape[-1] == 3: # Convert to (C, H, W)
+        if img.shape[-1] == 3: 
             img = np.transpose(img, (2, 0, 1))
             
-        # .copy() fixes PyTorch negative stride errors
         vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
     else:
-        raise ValueError(f"Image extracted is not an array! Type: {type(img)}")
+        raise ValueError("Image extracted is not an array!")
 
-    # Extract Proprioception
-    raw_prop = robot.get_dofs_position().cpu().numpy()
-    if raw_prop.ndim == 2: raw_prop = raw_prop[0] 
-    prop_array = np.zeros(47, dtype=np.float32)
-    prop_array[:min(47, len(raw_prop))] = raw_prop[:min(47, len(raw_prop))]
-    
-    prop_tensor = torch.from_numpy(prop_array.copy()).float().to(device)
+    # JEPA Proprio is exactly the first 47 dims of System 1's observation
+    dummy_cmd = torch.zeros((1, 3), device=device)
+    sys1_obs = get_system1_obs(robot, q0, prev_action, dummy_cmd, act_dofs, device)
+    prop_tensor = sys1_obs[:, :47].clone() 
         
-    return vis_tensor.unsqueeze(0), prop_tensor.unsqueeze(0)
+    return vis_tensor.unsqueeze(0), prop_tensor
 
 def move_cameras(robot, cam_brain):
     r_pos = robot.get_pos().cpu().numpy()
@@ -200,36 +245,32 @@ def main():
     scene, robot, cam_brain, act_dofs, q0 = init_genesis_scene(device)
     q0_np = q0.cpu().numpy()
 
-    # Settle physics
     for _ in range(10): scene.step()
 
-    # --- 1. Capture the Goal State ---
     print("🎯 Teleporting 0.29m forward to capture goal state...")
     robot.set_pos(np.array([0.29, 0.0, 0.12], dtype=np.float32))
     for _ in range(5): scene.step() 
     move_cameras(robot, cam_brain)
     
-    vis_goal, prop_goal = get_jepa_state(robot, cam_brain, device)
+    prev_action = torch.zeros((1, 12), device=device)
+    vis_goal, prop_goal = get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device)
     with torch.no_grad():
         z_goal = jepa.encoder(vis_goal, prop_goal).detach()
 
-    # --- 2. Capture the Start State ---
     print("⏪ Resetting to origin to map energy landscape...")
     robot.set_pos(np.array([0.0, 0.0, 0.12], dtype=np.float32))
     robot.set_dofs_position(q0_np, act_dofs)
-    # Removed set_vel and set_ang; kinematics reset is handled by pos/dofs.
     for _ in range(10): scene.step()
     move_cameras(robot, cam_brain)
 
-    vis_start, prop_start = get_jepa_state(robot, cam_brain, device)
+    vis_start, prop_start = get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device)
     with torch.no_grad():
         z_start = jepa.encoder(vis_start, prop_start).detach()
 
-    # --- 3. Grid Sweep (The Brain Scan) ---
     print(f"🧠 Scanning latent space across {args.res}x{args.res} command grid...")
     
-    vx_vals = np.linspace(-0.6, 0.6, args.res)   # Forward/Backward
-    om_vals = np.linspace(-0.8, 0.8, args.res)   # Yaw Left/Right
+    vx_vals = np.linspace(-0.6, 0.6, args.res)   
+    om_vals = np.linspace(-0.8, 0.8, args.res)   
     
     VX, OM = np.meshgrid(vx_vals, om_vals)
     COSTS = np.zeros_like(VX)
@@ -237,10 +278,8 @@ def main():
     with torch.no_grad():
         for i in range(args.res):
             for j in range(args.res):
-                # Create the candidate command [vx, vy=0, omega]
                 cmd = torch.tensor([[VX[i, j], 0.0, OM[i, j]]], device=device, dtype=torch.float32)
                 
-                # Rollout the predictor
                 z_pred = z_start.clone()
                 h_t = torch.zeros(1, 256, device=device)
                 cost_sum = 0
@@ -251,7 +290,6 @@ def main():
                     
                 COSTS[i, j] = cost_sum
 
-    # --- 4. Render the 3D Plot ---
     print("🎨 Rendering 3D Topographic Plot...")
     fig, ax = plt.subplots(subplot_kw={"projection": "3d"}, figsize=(10, 8))
     
@@ -264,7 +302,6 @@ def main():
     ax.set_ylabel("Turn Rate (omega)", fontsize=11, labelpad=10)
     ax.set_zlabel("Predicted Distance to Goal State", fontsize=11, labelpad=10)
     
-    # Invert Z so "valleys" (lower cost) look like funnels
     ax.invert_zaxis()
     
     fig.colorbar(surf, shrink=0.5, aspect=0.5, pad=0.1, label="Distance to Goal")

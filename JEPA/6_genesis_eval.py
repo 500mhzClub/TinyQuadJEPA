@@ -5,7 +5,7 @@ Demonstration Test: Can the JEPA seek a physically recorded goal state?
 
 Usage:
     python JEPA/6_genesis_eval.py \
-        --jepa_ckpt jepa_checkpoints/jepa_epoch_4_step_3000.pt \
+        --jepa_ckpt jepa_checkpoints/jepa_epoch_6_step_1000.pt \
         --ppo_ckpt runs/pupper_omni_20260225_150134/ckpt_20000.pt \
         --device cpu
 """
@@ -45,7 +45,7 @@ def atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 # -----------------------------------------
-# 1. System 1: PPO Low-Level Motor Control (Full Class)
+# 1. System 1: PPO Low-Level Motor Control
 # -----------------------------------------
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int = 50, act_dim: int = 12, hid: int = 256):
@@ -221,46 +221,8 @@ def init_genesis_scene(device):
 
     return scene, robot, cam_brain, cam_render, dofs_idx, torch.tensor(q0, device=device)
 
-def get_jepa_state(robot, cam_brain, device):
-    # Genesis 0.3.14 returns the image buffers directly from render()
-    render_out = cam_brain.render()
-    
-    img = None
-    if isinstance(render_out, tuple) and len(render_out) > 0:
-        img = render_out[0] # rgb is usually the first buffer
-    elif isinstance(render_out, dict):
-        img = render_out.get('rgb', render_out.get('color'))
-    elif hasattr(render_out, 'shape'):
-        img = render_out
-        
-    if img is None:
-        raise RuntimeError(f"cam.render() returned unexpected type: {type(render_out)}")
-
-    if hasattr(img, 'cpu'):
-        img = img.cpu().numpy()
-
-    if isinstance(img, np.ndarray):
-        if img.shape[-1] == 4: # Strip alpha channel
-            img = img[:, :, :3]
-        if img.shape[-1] == 3: # Convert to (C, H, W)
-            img = np.transpose(img, (2, 0, 1))
-            
-        # .copy() fixes PyTorch negative stride errors
-        vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
-    else:
-        raise ValueError(f"Image extracted is not an array! Type: {type(img)}")
-
-    # Extract Proprioception
-    raw_prop = robot.get_dofs_position().cpu().numpy()
-    if raw_prop.ndim == 2: raw_prop = raw_prop[0] 
-    prop_array = np.zeros(47, dtype=np.float32)
-    prop_array[:min(47, len(raw_prop))] = raw_prop[:min(47, len(raw_prop))]
-    
-    prop_tensor = torch.from_numpy(prop_array.copy()).float().to(device)
-        
-    return vis_tensor.unsqueeze(0), prop_tensor.unsqueeze(0)
-
 def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
+    """Calculates the full 50D kinematic state for PPO."""
     pos = robot.get_pos().to(device)
     if pos.dim() == 1: pos = pos.unsqueeze(0)
         
@@ -288,13 +250,47 @@ def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
     obs = torch.cat([z, quat, vel_b, ang_b, q_rel, dq, prev_action, cmd], dim=1)
     return obs
 
+def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
+    """Extracts exactly what the JEPA saw during training (Vision + 47D Proprio)."""
+    # 1. Vision Extraction (Fixed for Genesis 0.3.14)
+    render_out = cam_brain.render()
+    img = None
+    if isinstance(render_out, tuple) and len(render_out) > 0:
+        img = render_out[0] 
+    elif isinstance(render_out, dict):
+        img = render_out.get('rgb', render_out.get('color'))
+    elif hasattr(render_out, 'shape'):
+        img = render_out
+        
+    if img is None:
+        raise RuntimeError(f"cam.render() returned unexpected type: {type(render_out)}")
+
+    if hasattr(img, 'cpu'):
+        img = img.cpu().numpy()
+
+    if isinstance(img, np.ndarray):
+        if img.shape[-1] == 4: # Strip alpha channel
+            img = img[:, :, :3]
+        if img.shape[-1] == 3: # Convert to (C, H, W)
+            img = np.transpose(img, (2, 0, 1))
+            
+        vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
+    else:
+        raise ValueError("Image extracted is not an array!")
+
+    # 2. Proprioception Extraction (Fixed for Train/Test Parity)
+    dummy_cmd = torch.zeros((1, 3), device=device)
+    sys1_obs = get_system1_obs(robot, q0, prev_action, dummy_cmd, act_dofs, device)
+    
+    # JEPA Proprio is exactly the first 47 dims of System 1's observation
+    prop_tensor = sys1_obs[:, :47].clone() 
+        
+    return vis_tensor.unsqueeze(0), prop_tensor
+
 def move_cameras(robot, cam_brain, cam_render):
-    """Helper to keep cameras locked on the robot."""
     r_pos = robot.get_pos().cpu().numpy()
     if r_pos.ndim > 1: r_pos = r_pos[0]
-    
     c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
-    
     for cam in [cam_brain, cam_render]:
         try:
             cam.set_pose(pos=c_pos, lookat=r_pos, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
@@ -336,7 +332,6 @@ def main():
     q0_np = q0.cpu().numpy()
     action_scale = 0.30 
 
-    # Let physics settle
     for _ in range(10): scene.step()
     move_cameras(robot, cam_brain, cam_render)
 
@@ -344,10 +339,10 @@ def main():
     # DEMONSTRATION PHASE: Physically drive to the goal
     # -------------------------------------------------------------
     print("\n🎬 Recording a physically valid forward demonstration...")
-    demo_cmd = torch.tensor([[0.50, 0.0, 0.0]], device=device) # Hardcoded forward sprint
+    demo_cmd = torch.tensor([[0.50, 0.0, 0.0]], device=device) 
     prev_action_demo = torch.zeros((1, 12), device=device)
     
-    for demo_step in range(45): # Approx 1.5 seconds of walking
+    for demo_step in range(45): 
         sys1_obs = get_system1_obs(robot, q0, prev_action_demo, demo_cmd, act_dofs, device)
         with torch.no_grad():
             action = ppo.act_deterministic(sys1_obs)
@@ -360,16 +355,13 @@ def main():
         for _ in range(4): 
             scene.step()
         move_cameras(robot, cam_brain, cam_render)
-        
-        # Simple progress bar
         print(f"\rDriving forward... {demo_step+1}/45", end="")
 
-    # Settle at the goal location
     for _ in range(10): scene.step()
     move_cameras(robot, cam_brain, cam_render)
 
-    # Capture the true physical goal state
-    vis_goal, prop_goal = get_jepa_state(robot, cam_brain, device)
+    # Use the unified function to capture the correct goal state
+    vis_goal, prop_goal = get_jepa_state(robot, cam_brain, q0, prev_action_demo, act_dofs, device)
     with torch.no_grad():
         z_goal = jepa.encoder(vis_goal, prop_goal).detach()
     
@@ -385,8 +377,6 @@ def main():
     try:
         robot.set_pos(start_pos)
         robot.set_dofs_position(q0_np, act_dofs)
-        robot.set_vel(np.zeros(3, dtype=np.float32))
-        robot.set_ang(np.zeros(3, dtype=np.float32))
     except Exception:
         pass
         
@@ -408,7 +398,8 @@ def main():
 
             # --- SYSTEM 2: JEPA THINKS ---
             with torch.no_grad():
-                vis_t, prop_t = get_jepa_state(robot, cam_brain, device)
+                # Correctly structured 47D Proprioception passed here
+                vis_t, prop_t = get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device)
                 z_current = jepa.encoder(vis_t, prop_t)
                 cam_render.render() 
 
@@ -430,7 +421,6 @@ def main():
                 best_idx = torch.argmin(total_cost)
                 best_cmd = candidate_cmds[best_idx][0].unsqueeze(0) 
                 
-                # --- COST TELEMETRY ---
                 min_cost = total_cost[best_idx].item()
                 max_cost = torch.max(total_cost).item()
 
@@ -444,7 +434,6 @@ def main():
                 q_tgt_gs = q_tgt[0].detach().to(gs.device)
                 robot.control_dofs_position(q_tgt_gs, act_dofs)
 
-            # --- PHYSICS ENGINE ---
             for _ in range(4):
                 scene.step()
 

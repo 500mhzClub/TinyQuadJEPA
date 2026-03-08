@@ -131,44 +131,28 @@ def init_genesis_scene(device):
     return scene, robot, cam_brain, dofs_idx, torch.tensor(q0, device=device)
 
 def get_jepa_state(robot, cam_brain, device):
-    cam_brain.render()
+    # Genesis 0.3.14 returns the image buffers directly from render()
+    render_out = cam_brain.render()
     
-    # Robust Genesis Camera Extraction
     img = None
-    extraction_methods = ['get_images', 'get_images_dict', 'render_rgb', 'get_rgba', 'get_color']
-    
-    for method in extraction_methods:
-        if hasattr(cam_brain, method):
-            result = getattr(cam_brain, method)()
-            # Handle if the method returns a dictionary of buffers (common in Genesis 0.3)
-            if isinstance(result, dict):
-                if 'rgb' in result: img = result['rgb']
-                elif 'color' in result: img = result['color']
-            elif isinstance(result, (np.ndarray, torch.Tensor)):
-                img = result
-            if img is not None:
-                break
-                
-    # Fallback to direct properties if methods fail
+    if isinstance(render_out, tuple) and len(render_out) > 0:
+        img = render_out[0] # rgb is usually the first buffer
+    elif isinstance(render_out, dict):
+        img = render_out.get('rgb', render_out.get('color'))
+    elif hasattr(render_out, 'shape'):
+        img = render_out
+        
     if img is None:
-        if hasattr(cam_brain, 'rgb'): img = cam_brain.rgb
-        elif hasattr(cam_brain, 'rgba'): img = cam_brain.rgba
-            
-    # Hard crash if we are still blind
-    if img is None:
-        print("\n🚨 CRITICAL CAMERA ERROR 🚨")
-        print(f"Could not extract image. Available camera attributes:\n{[m for m in dir(cam_brain) if not m.startswith('_')]}")
-        raise RuntimeError("JEPA is blind! Fix the camera extraction API above.")
+        raise RuntimeError(f"cam.render() returned unexpected type: {type(render_out)}")
 
-    # Convert PyTorch tensors to Numpy if needed
     if hasattr(img, 'cpu'):
         img = img.cpu().numpy()
 
-    # Format the image array for the VisionEncoder (C, H, W)
     if isinstance(img, np.ndarray):
         if img.shape[-1] == 4: # Strip alpha channel
             img = img[:, :, :3]
-        img = np.transpose(img, (2, 0, 1))
+        if img.shape[-1] == 3: # Convert to (C, H, W)
+            img = np.transpose(img, (2, 0, 1))
         vis_tensor = torch.from_numpy(img).float().to(device) / 255.0
     else:
         raise ValueError(f"Image extracted is not an array! Type: {type(img)}")

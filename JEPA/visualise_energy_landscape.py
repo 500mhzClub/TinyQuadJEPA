@@ -153,7 +153,9 @@ def get_jepa_state(robot, cam_brain, device):
             img = img[:, :, :3]
         if img.shape[-1] == 3: # Convert to (C, H, W)
             img = np.transpose(img, (2, 0, 1))
-        vis_tensor = torch.from_numpy(img).float().to(device) / 255.0
+            
+        # 🔥 THE FIX: .copy() forces numpy to allocate fresh, contiguous memory
+        vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
     else:
         raise ValueError(f"Image extracted is not an array! Type: {type(img)}")
 
@@ -162,7 +164,9 @@ def get_jepa_state(robot, cam_brain, device):
     if raw_prop.ndim == 2: raw_prop = raw_prop[0] 
     prop_array = np.zeros(47, dtype=np.float32)
     prop_array[:min(47, len(raw_prop))] = raw_prop[:min(47, len(raw_prop))]
-    prop_tensor = torch.from_numpy(prop_array).float().to(device)
+    
+    # Adding .copy() here too just to be perfectly safe
+    prop_tensor = torch.from_numpy(prop_array.copy()).float().to(device)
         
     return vis_tensor.unsqueeze(0), prop_tensor.unsqueeze(0)
 

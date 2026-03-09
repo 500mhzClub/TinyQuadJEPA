@@ -4,7 +4,7 @@ System 2 EBM JEPA - Mind's Eye (CNN Feature Map Visualizer)
 Intercepts and visualizes the internal convolutional activations of the Vision Encoder.
 
 Usage:
-    python JEPA/visualize_feature_maps.py --ckpt jepa_checkpoints/jepa_epoch_6_step_2000.pt --device cpu
+    python JEPA/visualize_feature_maps.py --ckpt jepa_checkpoints/jepa_epoch_8_step_1000.pt --device cpu
 """
 import argparse
 import torch
@@ -132,7 +132,7 @@ def init_genesis_scene(device):
     )
     
     cam_brain = scene.add_camera(
-        res=(64, 64), pos=(0.8, -0.8, 0.45), lookat=(0.0, 0.0, 0.12), fov=50
+        res=(64, 64), pos=(0.0, 0.0, 0.0), lookat=(1.0, 0.0, 0.0), fov=50
     )
     
     scene.build()
@@ -206,14 +206,48 @@ def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
         
     return vis_tensor.unsqueeze(0), prop_tensor, raw_img
 
-def move_cameras(robot, cam_brain):
+def move_cameras(robot, cam_brain, cam_render=None):
+    """Mounts the camera securely to the nose of the robot."""
     r_pos = robot.get_pos().cpu().numpy()
-    if r_pos.ndim > 1: r_pos = r_pos[0]
-    c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
-    try:
-        cam_brain.set_pose(pos=c_pos, lookat=r_pos, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
-    except TypeError:
-        cam_brain.set_pose(pos=c_pos, lookat=r_pos)
+    r_quat = robot.get_quat().cpu().numpy()
+    
+    if r_pos.ndim > 1: 
+        r_pos = r_pos[0]
+        r_quat = r_quat[0]
+        
+    # Genesis quaternions are [w, x, y, z]
+    w, x, y, z = r_quat
+    
+    # Calculate the Forward vector (local X-axis rotated by body quat)
+    fx = 1 - 2 * (y**2 + z**2)
+    fy = 2 * (x*y + w*z)
+    fz = 2 * (x*z - w*y)
+    forward = np.array([fx, fy, fz], dtype=np.float32)
+    
+    # Calculate the Up vector (local Z-axis rotated by body quat)
+    ux = 2 * (x*z + w*y)
+    uy = 2 * (y*z - w*x)
+    uz = 1 - 2 * (x**2 + y**2)
+    up = np.array([ux, uy, uz], dtype=np.float32)
+
+    # Mount the camera at the "nose" of the dog
+    cam_pos = r_pos + (forward * 0.15) + (up * 0.05) 
+    
+    # Look straight ahead
+    look_target = cam_pos + (forward * 1.0)
+    
+    cams = [cam_brain]
+    if cam_render is not None:
+        cams.append(cam_render)
+        
+    for cam in cams:
+        try:
+            cam.set_pose(pos=cam_pos, lookat=look_target, up=up)
+        except TypeError:
+            try:
+                cam.set_pose(pos=cam_pos, lookat=look_target, up_vector=up)
+            except TypeError:
+                cam.set_pose(pos=cam_pos, lookat=look_target)
 
 # -----------------------------------------
 # Main Logic
@@ -271,7 +305,7 @@ def main():
     ax_orig = plt.subplot2grid((3, 8), (0, 3), colspan=2)
     if raw_img.shape[-1] == 4: raw_img = raw_img[:, :, :3]
     ax_orig.imshow(raw_img)
-    ax_orig.set_title("Original Robot View (64x64 RGB)", pad=10)
+    ax_orig.set_title("Egocentric Robot View (64x64 RGB)", pad=10)
     ax_orig.axis('off')
 
     # 2. Plot 16 channels from Layer 1 (Early Features)

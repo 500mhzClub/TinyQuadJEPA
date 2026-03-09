@@ -5,7 +5,7 @@ Demonstration Test: Can the JEPA seek a physically recorded goal state?
 
 Usage:
     python JEPA/6_genesis_eval.py \
-        --jepa_ckpt jepa_checkpoints/jepa_epoch_6_step_1000.pt \
+        --jepa_ckpt jepa_checkpoints/jepa_epoch_8_step_1000.pt \
         --ppo_ckpt runs/pupper_omni_20260225_150134/ckpt_20000.pt \
         --device cpu
 """
@@ -198,10 +198,10 @@ def init_genesis_scene(device):
     )
     
     cam_brain = scene.add_camera(
-        res=(64, 64), pos=(0.8, -0.8, 0.45), lookat=(0.0, 0.0, 0.12), fov=50
+        res=(64, 64), pos=(0.0, 0.0, 0.0), lookat=(1.0, 0.0, 0.0), fov=50
     )
     cam_render = scene.add_camera(
-        res=(512, 512), pos=(0.8, -0.8, 0.45), lookat=(0.0, 0.0, 0.12), fov=50
+        res=(512, 512), pos=(0.0, 0.0, 0.0), lookat=(1.0, 0.0, 0.0), fov=50
     )
     
     scene.build()
@@ -252,7 +252,6 @@ def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
 
 def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
     """Extracts exactly what the JEPA saw during training (Vision + 47D Proprio)."""
-    # 1. Vision Extraction (Fixed for Genesis 0.3.14)
     render_out = cam_brain.render()
     img = None
     if isinstance(render_out, tuple) and len(render_out) > 0:
@@ -269,36 +268,63 @@ def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
         img = img.cpu().numpy()
 
     if isinstance(img, np.ndarray):
-        if img.shape[-1] == 4: # Strip alpha channel
+        if img.shape[-1] == 4: 
             img = img[:, :, :3]
-        if img.shape[-1] == 3: # Convert to (C, H, W)
+        if img.shape[-1] == 3: 
             img = np.transpose(img, (2, 0, 1))
             
         vis_tensor = torch.from_numpy(img.copy()).float().to(device) / 255.0
     else:
         raise ValueError("Image extracted is not an array!")
 
-    # 2. Proprioception Extraction (Fixed for Train/Test Parity)
     dummy_cmd = torch.zeros((1, 3), device=device)
     sys1_obs = get_system1_obs(robot, q0, prev_action, dummy_cmd, act_dofs, device)
-    
-    # JEPA Proprio is exactly the first 47 dims of System 1's observation
     prop_tensor = sys1_obs[:, :47].clone() 
         
     return vis_tensor.unsqueeze(0), prop_tensor
 
-def move_cameras(robot, cam_brain, cam_render):
+def move_cameras(robot, cam_brain, cam_render=None):
+    """Mounts the camera securely to the nose of the robot."""
     r_pos = robot.get_pos().cpu().numpy()
-    if r_pos.ndim > 1: r_pos = r_pos[0]
-    c_pos = r_pos + np.array([0.8, -0.8, 0.33], dtype=np.float32)
-    for cam in [cam_brain, cam_render]:
+    r_quat = robot.get_quat().cpu().numpy()
+    
+    if r_pos.ndim > 1: 
+        r_pos = r_pos[0]
+        r_quat = r_quat[0]
+        
+    # Genesis quaternions are [w, x, y, z]
+    w, x, y, z = r_quat
+    
+    # Calculate the Forward vector (local X-axis rotated by body quat)
+    fx = 1 - 2 * (y**2 + z**2)
+    fy = 2 * (x*y + w*z)
+    fz = 2 * (x*z - w*y)
+    forward = np.array([fx, fy, fz], dtype=np.float32)
+    
+    # Calculate the Up vector (local Z-axis rotated by body quat)
+    ux = 2 * (x*z + w*y)
+    uy = 2 * (y*z - w*x)
+    uz = 1 - 2 * (x**2 + y**2)
+    up = np.array([ux, uy, uz], dtype=np.float32)
+
+    # Mount the camera at the "nose" of the dog
+    cam_pos = r_pos + (forward * 0.15) + (up * 0.05) 
+    
+    # Look straight ahead
+    look_target = cam_pos + (forward * 1.0)
+    
+    cams = [cam_brain]
+    if cam_render is not None:
+        cams.append(cam_render)
+        
+    for cam in cams:
         try:
-            cam.set_pose(pos=c_pos, lookat=r_pos, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+            cam.set_pose(pos=cam_pos, lookat=look_target, up=up)
         except TypeError:
             try:
-                cam.set_pose(pos=c_pos, lookat=r_pos, up_vector=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+                cam.set_pose(pos=cam_pos, lookat=look_target, up_vector=up)
             except TypeError:
-                cam.set_pose(pos=c_pos, lookat=r_pos)
+                cam.set_pose(pos=cam_pos, lookat=look_target)
 
 # -----------------------------------------
 # 4. Main Loop
@@ -360,7 +386,6 @@ def main():
     for _ in range(10): scene.step()
     move_cameras(robot, cam_brain, cam_render)
 
-    # Use the unified function to capture the correct goal state
     vis_goal, prop_goal = get_jepa_state(robot, cam_brain, q0, prev_action_demo, act_dofs, device)
     with torch.no_grad():
         z_goal = jepa.encoder(vis_goal, prop_goal).detach()
@@ -398,7 +423,6 @@ def main():
 
             # --- SYSTEM 2: JEPA THINKS ---
             with torch.no_grad():
-                # Correctly structured 47D Proprioception passed here
                 vis_t, prop_t = get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device)
                 z_current = jepa.encoder(vis_t, prop_t)
                 cam_render.render() 

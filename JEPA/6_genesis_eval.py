@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-System 1 + System 2 JEPA Demo Evaluation (drop-in replacement)
+Open-floor JEPA navigation demo (drop-in style replacement)
 
-What this script does:
-- optionally generates or loads a waypoint file
-- uses the JEPA predictor to choose high-level body-frame commands
-- uses the PPO policy as System 1 to execute those commands
-- records a polished side-by-side video with live HUD
-- writes a JSON summary for checkpoint comparisons
-
-Notes:
-- This is still primarily a **demo / smoke test**, not a held-out benchmark.
-- It is designed to remain compatible with the current project layout and CLI.
+Purpose:
+- remove obstacle-avoidance confounds
+- show that the current JEPA-style model can drive the robot toward
+  reachable latent goals in open space
+- produce a cleaner demo with forward / strafe / turn primitives
 
 Usage:
     python JEPA/6_genesis_eval.py \
@@ -22,6 +17,7 @@ Usage:
 import os
 import json
 import time
+import math
 import argparse
 from typing import List, Tuple
 
@@ -34,8 +30,9 @@ from PIL import Image, ImageDraw
 
 import genesis as gs
 
+
 # -----------------------------------------
-# Quaternion Helpers
+# Quaternion helpers
 # -----------------------------------------
 def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
     return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
@@ -59,6 +56,17 @@ def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 def world_to_body_vec(quat_wxyz: torch.Tensor, vec_world: torch.Tensor) -> torch.Tensor:
     return quat_rotate_wxyz(quat_conj_wxyz(quat_wxyz), vec_world)
+
+
+def quat_to_yaw_wxyz_np(q: np.ndarray) -> float:
+    w, x, y, z = q
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return float(np.arctan2(siny_cosp, cosy_cosp))
+
+
+def angle_wrap(a: float) -> float:
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
 
 
 # -----------------------------------------
@@ -109,7 +117,6 @@ def project_3d_to_2d(pt_3d, cam_pos, look_at, fov_deg=50, res=(768, 768)):
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int = 50, act_dim: int = 12, hid: int = 256):
         super().__init__()
-        self.act_dim = act_dim
         self.actor = nn.Sequential(
             nn.Linear(obs_dim, hid), nn.Tanh(),
             nn.Linear(hid, hid), nn.Tanh(),
@@ -161,7 +168,7 @@ class JointEncoder(nn.Module):
         self.vis_enc = VisionEncoder(feature_dim=128)
         self.prop_enc = ProprioEncoder(input_dim=47, feature_dim=128)
         self.fusion = nn.Sequential(
-            nn.Linear(128 + 128, 256), nn.ELU(),
+            nn.Linear(256, 256), nn.ELU(),
             nn.Linear(256, latent_dim),
         )
 
@@ -174,9 +181,7 @@ class JointEncoder(nn.Module):
 class LatentPredictor(nn.Module):
     def __init__(self, latent_dim: int = 256, cmd_dim: int = 3):
         super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(latent_dim + cmd_dim, latent_dim), nn.ELU()
-        )
+        self.input_proj = nn.Sequential(nn.Linear(latent_dim + cmd_dim, latent_dim), nn.ELU())
         self.rnn = nn.GRUCell(input_size=latent_dim, hidden_size=latent_dim)
         self.output_proj = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.ELU(),
@@ -197,10 +202,10 @@ class EBM_TinyQuadJEPA(nn.Module):
 
 
 # -----------------------------------------
-# Scene setup
+# Scene setup (open floor)
 # -----------------------------------------
 def init_genesis_scene(device):
-    print("🌍 Booting Genesis Simulator (Headless CPU Mode)...")
+    print("🌍 Booting Genesis Simulator (Open-Floor Demo Mode)...")
     gs.init(backend=gs.cpu)
     scene = gs.Scene(show_viewer=False)
 
@@ -217,19 +222,6 @@ def init_genesis_scene(device):
             diffuse_texture=gs.textures.ImageTexture(image_path=tex_path)
         ),
     )
-
-    blue_mat = gs.surfaces.Rough(color=(0.1, 0.4, 0.8, 1.0))
-    obstacles = [
-        (0.15, -0.15, 0.1, 0.1, 0.1, 0.2),
-        (0.35,  0.15, 0.1, 0.1, 0.1, 0.2),
-        (0.55, -0.15, 0.1, 0.1, 0.1, 0.2),
-        (0.75,  0.15, 0.1, 0.1, 0.1, 0.2),
-    ]
-    for ox, oy, oz, sx, sy, sz in obstacles:
-        scene.add_entity(
-            gs.morphs.Box(pos=(ox, oy, oz), size=(sx, sy, sz), fixed=True),
-            surface=blue_mat,
-        )
 
     robot = scene.add_entity(
         gs.morphs.URDF(
@@ -263,8 +255,7 @@ def init_genesis_scene(device):
     robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs_idx)
     robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs_idx)
 
-    obstacle_xy = np.array([(o[0], o[1]) for o in obstacles], dtype=np.float32)
-    return scene, robot, cam_brain, cam_ego_vis, cam_3rd, dofs_idx, torch.tensor(q0, device=device), obstacle_xy
+    return scene, robot, cam_brain, cam_ego_vis, cam_3rd, dofs_idx, torch.tensor(q0, device=device)
 
 
 # -----------------------------------------
@@ -315,7 +306,7 @@ def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
 
 
 # -----------------------------------------
-# Cameras and demo rendering
+# Cameras and HUD
 # -----------------------------------------
 def move_cameras(robot, cam_brain, cam_ego_vis, cam_3rd=None, goal_pos=None):
     r_pos = robot.get_pos().cpu().numpy()
@@ -345,9 +336,9 @@ def move_cameras(robot, cam_brain, cam_ego_vis, cam_3rd=None, goal_pos=None):
 
     cam_3rd_pos, look_at_pt = None, None
     if cam_3rd is not None:
-        cam_3rd_pos = r_pos + np.array([-1.0, 0.0, 0.8], dtype=np.float32)
+        cam_3rd_pos = r_pos + np.array([-1.3, 0.0, 0.9], dtype=np.float32)
         if goal_pos is not None:
-            look_at_pt = 0.65 * r_pos + 0.35 * goal_pos
+            look_at_pt = 0.55 * r_pos + 0.45 * goal_pos
         else:
             look_at_pt = r_pos + forward * 0.5
         try:
@@ -387,45 +378,45 @@ def compose_frame(img_ego, img_3rd, hud_lines: List[str]) -> np.ndarray:
     combined.paste(Image.fromarray(img_ego), (0, 0))
     combined.paste(Image.fromarray(img_3rd), (768, 0))
     draw = ImageDraw.Draw(combined)
-
-    draw.rectangle([(8, 8), (430, 170)], fill=(0, 0, 0))
+    draw.rectangle([(8, 8), (520, 190)], fill=(0, 0, 0))
     draw.text((16, 14), "Left: ego view used by JEPA", fill=(255, 255, 255))
-    draw.text((784, 14), "Right: external tracking view", fill=(255, 255, 255))
+    draw.text((784, 14), "Right: external open-floor tracking view", fill=(255, 255, 255))
 
     y = 40
     for line in hud_lines:
         draw.text((16, y), line, fill=(255, 255, 255))
         y += 18
-
     return np.array(combined)
 
 
 # -----------------------------------------
-# Waypoints
+# Open-floor primitive demonstration path
 # -----------------------------------------
-def scripted_path():
+def primitive_script():
     return [
-        (15, [0.30, 0.0,  0.50]),
-        (20, [0.30, 0.0, -0.50]),
-        (20, [0.30, 0.0,  0.50]),
-        (20, [0.30, 0.0, -0.50]),
-        (15, [0.30, 0.0,  0.50]),
-        (10, [0.30, 0.0,  0.00]),
+        ("forward",  24, [0.28,  0.00,  0.00]),
+        ("left",     16, [0.00,  0.16,  0.00]),
+        ("right",    16, [0.00, -0.16,  0.00]),
+        ("turn_l",   18, [0.00,  0.00,  0.55]),
+        ("forward2", 18, [0.24,  0.00,  0.00]),
+        ("turn_r",   18, [0.00,  0.00, -0.55]),
+        ("diag",     18, [0.18,  0.10,  0.10]),
     ]
 
 
 def capture_demo_waypoints(scene, robot, cam_brain, cam_ego_vis, act_dofs, q0, ppo, jepa, device,
                            action_scale: float, waypoint_stride: int, min_waypoint_spacing: float):
-    print("\n🎬 Driving scripted slalom to generate physically valid latent waypoints...")
+    print("\n🎬 Driving primitive open-floor demo to generate reachable latent waypoints...")
 
     waypoints_z: List[np.ndarray] = []
     waypoints_pos: List[np.ndarray] = []
+    waypoints_yaw: List[float] = []
     prev_action_demo = torch.zeros((1, 12), device=device)
     demo_step_count = 0
     last_keep_xy = None
-    total_demo_steps = sum(d for d, _ in scripted_path())
+    total_demo_steps = sum(d for _, d, _ in primitive_script())
 
-    for duration, cmd_vals in scripted_path():
+    for phase_name, duration, cmd_vals in primitive_script():
         demo_cmd = torch.tensor([cmd_vals], device=device, dtype=torch.float32)
         for _ in range(duration):
             sys1_obs = get_system1_obs(robot, q0, prev_action_demo, demo_cmd, act_dofs, device)
@@ -441,12 +432,14 @@ def capture_demo_waypoints(scene, robot, cam_brain, cam_ego_vis, act_dofs, q0, p
             move_cameras(robot, cam_brain, cam_ego_vis)
 
             demo_step_count += 1
-            print(f"\rDriving slalom path... {demo_step_count}/{total_demo_steps}", end="")
+            print(f"\rDriving primitive path... {demo_step_count}/{total_demo_steps} [{phase_name}]", end="")
 
             if demo_step_count % waypoint_stride == 0:
                 pos_w = robot.get_pos().cpu().numpy()
+                quat_w = robot.get_quat().cpu().numpy()
                 if pos_w.ndim > 1:
                     pos_w = pos_w[0]
+                    quat_w = quat_w[0]
                 keep = False
                 if last_keep_xy is None:
                     keep = True
@@ -460,21 +453,26 @@ def capture_demo_waypoints(scene, robot, cam_brain, cam_ego_vis, act_dofs, q0, p
                     pos_keep[2] = 0.10
                     waypoints_z.append(z_w)
                     waypoints_pos.append(pos_keep)
+                    waypoints_yaw.append(quat_to_yaw_wxyz_np(quat_w))
                     last_keep_xy = pos_keep[:2].copy()
 
-    print(f"\n✅ Captured {len(waypoints_z)} spaced latent waypoints.")
-    return np.stack(waypoints_z), np.stack(waypoints_pos)
+    print(f"\n✅ Captured {len(waypoints_z)} spaced open-floor waypoints.")
+    return np.stack(waypoints_z), np.stack(waypoints_pos), np.asarray(waypoints_yaw, dtype=np.float32)
 
 
-def save_waypoints(path: str, z: np.ndarray, pos: np.ndarray):
+def save_waypoints(path: str, z: np.ndarray, pos: np.ndarray, yaw: np.ndarray):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    np.savez_compressed(path, waypoints_z=z, waypoints_pos=pos)
+    np.savez_compressed(path, waypoints_z=z, waypoints_pos=pos, waypoints_yaw=yaw)
     print(f"💾 Saved waypoint file to {path}")
 
 
 def load_waypoints(path: str):
     data = np.load(path)
-    return data["waypoints_z"], data["waypoints_pos"]
+    if "waypoints_yaw" in data:
+        return data["waypoints_z"], data["waypoints_pos"], data["waypoints_yaw"]
+    # backward-compatible fallback
+    n = len(data["waypoints_pos"])
+    return data["waypoints_z"], data["waypoints_pos"], np.zeros((n,), dtype=np.float32)
 
 
 # -----------------------------------------
@@ -485,14 +483,16 @@ def build_candidate_bank(prev_best_cmd: torch.Tensor, n: int, device: torch.devi
         [0.00, 0.00, 0.00],
         [0.20, 0.00, 0.00],
         [0.30, 0.00, 0.00],
-        [0.35, 0.00, 0.20],
-        [0.35, 0.00, -0.20],
-        [0.30, 0.00, 0.45],
-        [0.30, 0.00, -0.45],
-        [0.20, 0.10, 0.20],
-        [0.20, -0.10, -0.20],
-        [0.10, 0.00, 0.60],
-        [0.10, 0.00, -0.60],
+        [0.00, 0.16, 0.00],
+        [0.00, -0.16, 0.00],
+        [0.10, 0.08, 0.00],
+        [0.10, -0.08, 0.00],
+        [0.00, 0.00, 0.35],
+        [0.00, 0.00, -0.35],
+        [0.00, 0.00, 0.55],
+        [0.00, 0.00, -0.55],
+        [0.18, 0.10, 0.10],
+        [0.18, -0.10, -0.10],
     ], device=device, dtype=torch.float32)
 
     if prev_best_cmd is not None:
@@ -501,6 +501,8 @@ def build_candidate_bank(prev_best_cmd: torch.Tensor, n: int, device: torch.devi
             prev,
             prev + torch.tensor([[0.06, 0.00, 0.00]], device=device),
             prev + torch.tensor([[-0.06, 0.00, 0.00]], device=device),
+            prev + torch.tensor([[0.00, 0.05, 0.00]], device=device),
+            prev + torch.tensor([[0.00, -0.05, 0.00]], device=device),
             prev + torch.tensor([[0.00, 0.00, 0.12]], device=device),
             prev + torch.tensor([[0.00, 0.00, -0.12]], device=device),
         ], dim=0)
@@ -509,7 +511,7 @@ def build_candidate_bank(prev_best_cmd: torch.Tensor, n: int, device: torch.devi
     remaining = max(0, n - templates.shape[0])
     rand = (torch.rand((remaining, 3), device=device) * 2.0) - 1.0
     rand[:, 0] *= 0.40
-    rand[:, 1] *= 0.25
+    rand[:, 1] *= 0.22
     rand[:, 2] *= 0.60
 
     if prev_best_cmd is not None and remaining > 0:
@@ -517,13 +519,13 @@ def build_candidate_bank(prev_best_cmd: torch.Tensor, n: int, device: torch.devi
         noise = torch.randn((half, 3), device=device) * torch.tensor([0.08, 0.05, 0.15], device=device)
         local = prev_best_cmd.view(1, 3) + noise
         local[:, 0] = local[:, 0].clamp(-0.40, 0.40)
-        local[:, 1] = local[:, 1].clamp(-0.25, 0.25)
+        local[:, 1] = local[:, 1].clamp(-0.22, 0.22)
         local[:, 2] = local[:, 2].clamp(-0.60, 0.60)
         rand[:half] = local
 
     cmds = torch.cat([templates, rand], dim=0)
     cmds[:, 0] = cmds[:, 0].clamp(-0.40, 0.40)
-    cmds[:, 1] = cmds[:, 1].clamp(-0.25, 0.25)
+    cmds[:, 1] = cmds[:, 1].clamp(-0.22, 0.22)
     cmds[:, 2] = cmds[:, 2].clamp(-0.60, 0.60)
     return cmds[:n]
 
@@ -541,13 +543,12 @@ def plan_best_cmd(jepa, z_current, z_goal, h_exec, prev_best_cmd, candidates: in
             z_pred, h_batch = jepa.predictor(z_pred, cmd_seq[:, t], h_batch)
 
         latent_cost = 1.0 - F.cosine_similarity(z_pred, z_goal.expand_as(z_pred), dim=-1)
-        reg_turn = 0.08 * candidate_cmds[:, 2].abs()
-        reg_side = 0.10 * candidate_cmds[:, 1].abs()
-        reg_stop = 0.04 * F.relu(0.05 - candidate_cmds[:, 0])
+        reg_turn = 0.05 * candidate_cmds[:, 2].abs()
+        reg_side = 0.03 * candidate_cmds[:, 1].abs()
+        reg_stop = 0.02 * F.relu(0.04 - candidate_cmds[:, 0])
+        smooth = torch.zeros_like(latent_cost)
         if prev_best_cmd is not None:
-            smooth = 0.08 * (candidate_cmds - prev_best_cmd.view(1, 3)).pow(2).sum(dim=-1)
-        else:
-            smooth = torch.zeros_like(latent_cost)
+            smooth = 0.05 * (candidate_cmds - prev_best_cmd.view(1, 3)).pow(2).sum(dim=-1)
         total_cost = latent_cost + reg_turn + reg_side + reg_stop + smooth
 
         best_idx = torch.argmin(total_cost)
@@ -571,16 +572,17 @@ def main():
     parser.add_argument("--ppo_ckpt", type=str, required=True)
     parser.add_argument("--candidates", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=15)
-    parser.add_argument("--steps", type=int, default=600)
+    parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--plan_freq", type=int, default=5)
-    parser.add_argument("--out", type=str, default="eval_output.mp4")
+    parser.add_argument("--out", type=str, default="eval_output_open_nav.mp4")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--waypoints_file", type=str, default="")
-    parser.add_argument("--save_waypoints", type=str, default="jepa_logs/demo_waypoints.npz")
-    parser.add_argument("--waypoint_stride", type=int, default=3)
-    parser.add_argument("--min_waypoint_spacing", type=float, default=0.065)
-    parser.add_argument("--reach_tol", type=float, default=0.10)
-    parser.add_argument("--summary_json", type=str, default="jepa_logs/eval_summary.json")
+    parser.add_argument("--save_waypoints", type=str, default="jepa_logs/open_nav_waypoints.npz")
+    parser.add_argument("--waypoint_stride", type=int, default=5)
+    parser.add_argument("--min_waypoint_spacing", type=float, default=0.10)
+    parser.add_argument("--reach_tol", type=float, default=0.11)
+    parser.add_argument("--yaw_tol", type=float, default=0.45)
+    parser.add_argument("--summary_json", type=str, default="jepa_logs/eval_open_nav_summary.json")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -596,7 +598,7 @@ def main():
     ppo.eval()
     print("✅ Both checkpoints loaded successfully!")
 
-    scene, robot, cam_brain, cam_ego_vis, cam_3rd, act_dofs, q0, obstacle_xy = init_genesis_scene(device)
+    scene, robot, cam_brain, cam_ego_vis, cam_3rd, act_dofs, q0 = init_genesis_scene(device)
     q0_np = q0.cpu().numpy()
     action_scale = 0.30
 
@@ -604,28 +606,27 @@ def main():
         scene.step()
 
     if args.waypoints_file and os.path.exists(args.waypoints_file):
-        print(f"📦 Loading held waypoint file from {args.waypoints_file}")
-        waypoints_z_np, waypoints_pos_np = load_waypoints(args.waypoints_file)
+        print(f"📦 Loading waypoint file from {args.waypoints_file}")
+        waypoints_z_np, waypoints_pos_np, waypoints_yaw_np = load_waypoints(args.waypoints_file)
     else:
-        waypoints_z_np, waypoints_pos_np = capture_demo_waypoints(
+        waypoints_z_np, waypoints_pos_np, waypoints_yaw_np = capture_demo_waypoints(
             scene, robot, cam_brain, cam_ego_vis, act_dofs, q0, ppo, jepa, device,
             action_scale=action_scale,
             waypoint_stride=args.waypoint_stride,
             min_waypoint_spacing=args.min_waypoint_spacing,
         )
         if args.save_waypoints:
-            save_waypoints(args.save_waypoints, waypoints_z_np, waypoints_pos_np)
+            save_waypoints(args.save_waypoints, waypoints_z_np, waypoints_pos_np, waypoints_yaw_np)
 
     waypoints_z = torch.from_numpy(waypoints_z_np).float().to(device)
 
-    print("⏪ Resetting to origin to begin latent tracking test...")
+    print("⏪ Resetting to origin to begin open-floor latent tracking test...")
     start_pos = np.array([0.0, 0.0, 0.12], dtype=np.float32)
     try:
         robot.set_pos(start_pos)
         robot.set_dofs_position(q0_np, act_dofs)
     except Exception:
         pass
-
     for _ in range(20):
         scene.step()
 
@@ -633,10 +634,18 @@ def main():
     prev_action = torch.zeros((1, 12), device=device)
     prev_best_cmd = torch.zeros((1, 3), device=device)
     h_exec = torch.zeros((1, 256), device=device)
+    last_plan_stats = {
+        "best_total_cost": float("nan"),
+        "best_latent_cost": float("nan"),
+        "candidate_cost_min": float("nan"),
+        "candidate_cost_mean": float("nan"),
+        "candidate_cost_max": float("nan"),
+    }
 
     target_idx = 0
     z_goal = waypoints_z[target_idx:target_idx + 1]
     goal_pos_np = waypoints_pos_np[target_idx].copy()
+    goal_yaw = float(waypoints_yaw_np[target_idx])
 
     steps_taken = 0
     replans = 0
@@ -644,12 +653,12 @@ def main():
     completed = False
     latent_cost_history = []
     dist_history = []
-    clearance_history = []
+    yaw_err_history = []
 
     ckpt_epoch = int(jepa_ckpt.get("epoch", -1)) + 1 if isinstance(jepa_ckpt.get("epoch", None), int) else jepa_ckpt.get("epoch", "Unknown")
     ckpt_step = int(jepa_ckpt.get("batch_idx", -1)) + 1 if isinstance(jepa_ckpt.get("batch_idx", None), int) else jepa_ckpt.get("batch_idx", "Unknown")
 
-    print(f"\n🐕 Running zero-shot latent tracking demo for up to {args.steps} steps...\n")
+    print(f"\n🐕 Running open-floor JEPA navigation demo for up to {args.steps} steps...\n")
 
     try:
         for step_count in range(args.steps):
@@ -663,18 +672,21 @@ def main():
                 z_current = jepa.encoder(vis_t, prop_t)
 
             r_pos_current = robot.get_pos().cpu().numpy()
+            r_quat_current = robot.get_quat().cpu().numpy()
             if r_pos_current.ndim > 1:
                 r_pos_current = r_pos_current[0]
+                r_quat_current = r_quat_current[0]
+            yaw_now = quat_to_yaw_wxyz_np(r_quat_current)
+            yaw_err = abs(angle_wrap(yaw_now - goal_yaw))
             dist_to_goal = float(np.linalg.norm(r_pos_current[:2] - goal_pos_np[:2]))
-            obs_dists = np.linalg.norm(obstacle_xy - r_pos_current[:2], axis=1)
-            min_clearance = float(obs_dists.min()) if len(obs_dists) else float("nan")
 
-            if dist_to_goal < args.reach_tol:
+            if dist_to_goal < args.reach_tol and yaw_err < args.yaw_tol:
                 if target_idx < len(waypoints_pos_np) - 1:
                     target_idx += 1
                     reached = target_idx
                     z_goal = waypoints_z[target_idx:target_idx + 1]
                     goal_pos_np = waypoints_pos_np[target_idx].copy()
+                    goal_yaw = float(waypoints_yaw_np[target_idx])
                     print(f"\n✅ Reached waypoint {target_idx}/{len(waypoints_pos_np)}. Advancing...")
                 else:
                     completed = True
@@ -694,18 +706,12 @@ def main():
                     device=device,
                 )
                 prev_best_cmd = best_cmd.clone()
+                last_plan_stats = plan_stats
                 replans += 1
             else:
                 best_cmd = prev_best_cmd
-                plan_stats = {
-                    "best_total_cost": float("nan"),
-                    "best_latent_cost": float("nan"),
-                    "candidate_cost_min": float("nan"),
-                    "candidate_cost_mean": float("nan"),
-                    "candidate_cost_max": float("nan"),
-                }
+                plan_stats = last_plan_stats
 
-            # Update hidden state with the command that will actually be executed.
             with torch.no_grad():
                 _, h_exec = jepa.predictor(z_current, best_cmd, h_exec)
                 sys1_obs = get_system1_obs(robot, q0, prev_action, best_cmd, act_dofs, device)
@@ -714,7 +720,6 @@ def main():
 
             q_tgt = q0.unsqueeze(0) + action_scale * action
             robot.control_dofs_position(q_tgt[0].detach().to(gs.device), act_dofs)
-
             for _ in range(4):
                 scene.step()
 
@@ -725,15 +730,15 @@ def main():
 
             latent_cost_history.append(plan_stats["best_latent_cost"])
             dist_history.append(dist_to_goal)
-            clearance_history.append(min_clearance)
+            yaw_err_history.append(yaw_err)
 
             hz = 1.0 / max(time.perf_counter() - loop_start, 1e-6)
             hud_lines = [
                 f"Checkpoint: epoch={ckpt_epoch} step={ckpt_step}",
                 f"Waypoint: {target_idx + 1}/{len(waypoints_pos_np)}   reached={reached}",
-                f"Distance to goal: {dist_to_goal:.3f} m   clearance≈{min_clearance:.3f} m",
+                f"Distance: {dist_to_goal:.3f} m   yaw err: {yaw_err:.2f} rad",
                 f"Cmd: vx={best_cmd[0,0]:+.2f} vy={best_cmd[0,1]:+.2f} wz={best_cmd[0,2]:+.2f}",
-                f"Latent cost: {plan_stats['best_latent_cost']:.3f}   total cost: {plan_stats['best_total_cost']:.3f}",
+                f"Latent cost: {plan_stats['best_latent_cost']:.3f}   total: {plan_stats['best_total_cost']:.3f}",
                 f"Planner mean/min cost: {plan_stats['candidate_cost_mean']:.3f} / {plan_stats['candidate_cost_min']:.3f}",
                 f"Replans: {replans}   sim loop: {hz:5.1f} Hz",
             ]
@@ -742,7 +747,7 @@ def main():
 
             print(
                 f"\r⚡ step={step_count+1:04d}/{args.steps} | wpt={target_idx+1:02d}/{len(waypoints_pos_np)} "
-                f"| dist={dist_to_goal:.3f} | clr={min_clearance:.3f} "
+                f"| dist={dist_to_goal:.3f} | yaw={yaw_err:.2f} "
                 f"| cmd=[{best_cmd[0,0]:+.2f}, {best_cmd[0,1]:+.2f}, {best_cmd[0,2]:+.2f}] "
                 f"| latent={plan_stats['best_latent_cost']:.3f} | hz={hz:4.1f}",
                 end="",
@@ -754,9 +759,12 @@ def main():
         video_writer.close()
 
     final_pos = robot.get_pos().cpu().numpy()
+    final_quat = robot.get_quat().cpu().numpy()
     if final_pos.ndim > 1:
         final_pos = final_pos[0]
+        final_quat = final_quat[0]
     final_goal_dist = float(np.linalg.norm(final_pos[:2] - goal_pos_np[:2]))
+    final_yaw_err = float(abs(angle_wrap(quat_to_yaw_wxyz_np(final_quat) - goal_yaw)))
 
     summary = {
         "jepa_ckpt": args.jepa_ckpt,
@@ -771,9 +779,10 @@ def main():
         "waypoint_fraction": float(reached / max(len(waypoints_pos_np), 1)),
         "replans": int(replans),
         "final_goal_dist": final_goal_dist,
+        "final_yaw_err": final_yaw_err,
         "mean_latent_cost": float(np.nanmean(latent_cost_history)) if latent_cost_history else float("nan"),
         "mean_goal_dist": float(np.nanmean(dist_history)) if dist_history else float("nan"),
-        "min_clearance": float(np.nanmin(clearance_history)) if clearance_history else float("nan"),
+        "mean_yaw_err": float(np.nanmean(yaw_err_history)) if yaw_err_history else float("nan"),
         "video_path": args.out,
     }
 

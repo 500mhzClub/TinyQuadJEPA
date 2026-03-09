@@ -2,10 +2,11 @@
 """
 System 2 EBM JEPA Training Loop (VICReg Formulation)
 Optimized with AMP, PyTorch Compiler, Worker-Side Batching, and Late GPU Casting.
-Includes CSV Logging, 5-Batch Sanity Check, and Mandatory Intra-Epoch Checkpointing.
+Includes CSV Logging, 5-Batch Sanity Check, Intra-Epoch Checkpointing, and Resume.
 
 Usage:
     python JEPA/train_jepa.py
+    python JEPA/train_jepa.py --resume_from jepa_checkpoints/jepa_epoch_8_step_3000.pt
 """
 import os
 import glob
@@ -13,6 +14,7 @@ import random
 import h5py
 import gc
 import csv
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -232,7 +234,7 @@ class EBM_TinyQuadJEPA(nn.Module):
 # -----------------------------------------
 # 3. Backpropagation Through Time (BPTT)
 # -----------------------------------------
-def train():
+def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Initializing EBM JEPA Training on {device}...")
 
@@ -244,13 +246,30 @@ def train():
     dataloader = DataLoader(
         dataset, 
         batch_size=None,      
-        num_workers=12,       
+        num_workers=12,        
         pin_memory=True,      
         prefetch_factor=2,
     )
 
     model = EBM_TinyQuadJEPA().to(device)
     
+    # --- RESUME LOGIC (MODEL) ---
+    start_epoch = 0
+    start_batch = -1
+    global_step = 0
+    
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"🔄 Resuming from checkpoint: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device)
+        
+        # Clean out compilation tags if present
+        cleaned_state_dict = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state_dict'].items()}
+        model.load_state_dict(cleaned_state_dict)
+        
+        start_epoch = ckpt.get('epoch', 0)
+        start_batch = ckpt.get('batch_idx', -1)
+        global_step = (start_epoch * total_batches) + (start_batch + 1)
+
     if hasattr(torch, 'compile'):
         print("⚙️ Compiling model into optimized GPU assembly (this will hang for ~1 minute on startup)...")
         model = torch.compile(model)
@@ -259,13 +278,22 @@ def train():
     epochs = 20
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     
+    # --- RESUME LOGIC (OPTIMIZER & SCHEDULER) ---
+    if args.resume_from and os.path.exists(args.resume_from):
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            # Catch up the learning rate scheduler
+            for _ in range(start_epoch):
+                scheduler.step()
+            print(f"✅ Restored optimizer state. Fast-forwarding to Epoch {start_epoch+1}, Batch {start_batch+2}.")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not restore optimizer state: {e}")
+
     scaler = GradScaler('cuda')
     
-    # Setup directories
     os.makedirs("jepa_checkpoints", exist_ok=True)
     os.makedirs("jepa_logs", exist_ok=True)
     
-    # 🔥 Initialize CSV Logger
     csv_path = "jepa_logs/training_metrics.csv"
     write_header = not os.path.exists(csv_path)
     with open(csv_path, mode='a', newline='') as f:
@@ -274,15 +302,18 @@ def train():
             writer.writerow(["Epoch", "Batch", "Global_Step", "Total_Energy", "Sim", "Var", "Cov", "LR"])
     
     save_interval = 1000 
-    global_step = 0
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         pbar = tqdm(dataloader, total=total_batches, desc=f"Epoch {epoch+1}/{epochs}")
         
         total_epoch_loss = 0
         
         for batch_idx, (vis, prop, cmds, dones) in enumerate(pbar):
+            # 🔥 Fast-forward iterator if resuming mid-epoch
+            if epoch == start_epoch and batch_idx <= start_batch:
+                continue
+                
             vis = vis.to(device, non_blocking=True).float() / 255.0
             prop = prop.to(device, non_blocking=True)
             cmds = cmds.to(device, non_blocking=True)
@@ -316,11 +347,9 @@ def train():
 
             total_epoch_loss += seq_loss.item()
             
-            # Calculate step averages
             current_lr = scheduler.get_last_lr()[0]
             s_avg, v_avg, c_avg = sim_avg/15, var_avg/15, cov_avg/15
             
-            # 🔥 Log to CSV every single batch
             with open(csv_path, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([epoch+1, batch_idx+1, global_step+1, seq_loss.item(), s_avg, v_avg, c_avg, current_lr])
@@ -333,8 +362,8 @@ def train():
                     "LR": f"{current_lr:.1e}"
                 })
                 
-            # 🔥 5-Batch Sanity Check (Triggers at exactly batch 5)
-            if batch_idx == 4:
+            # 5-Batch Sanity Check (Triggers at exactly batch 5 during a fresh run)
+            if batch_idx == 4 and start_epoch == 0 and start_batch == -1:
                 torch.save({
                     'epoch': epoch,
                     'batch_idx': batch_idx,
@@ -344,9 +373,9 @@ def train():
                 }, "jepa_checkpoints/jepa_sanity_check_batch_5.pt")
                 print("\n✅ Sanity check passed: 5-batch checkpoint written to drive successfully.")
 
-            # Standard safety checkpoint
             if (batch_idx + 1) % save_interval == 0:
-                step_loss = total_epoch_loss / (batch_idx + 1)
+                batches_processed = (batch_idx + 1) if epoch != start_epoch else (batch_idx - start_batch)
+                step_loss = total_epoch_loss / max(1, batches_processed)
                 torch.save({
                     'epoch': epoch,
                     'batch_idx': batch_idx,
@@ -360,8 +389,8 @@ def train():
 
         scheduler.step()
         
-        # Safe length division using the fixed integer
-        avg_loss = total_epoch_loss / total_batches 
+        batches_in_epoch = total_batches if epoch != start_epoch else (total_batches - start_batch - 1)
+        avg_loss = total_epoch_loss / max(1, batches_in_epoch)
         print(f"🏁 Epoch {epoch+1} Complete | Avg Energy: {avg_loss:.4f}")
         
         torch.save({
@@ -372,4 +401,8 @@ def train():
         }, f"jepa_checkpoints/jepa_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
+    args = parser.parse_args()
+    
+    train(args)

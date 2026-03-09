@@ -257,7 +257,8 @@ def main():
     jepa.eval()
 
     ppo = ActorCritic(obs_dim=50, act_dim=12).to(device)
-    ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=device)['model'])
+    # 🔥 FIX: strict=False prevents errors from missing critic/log_std keys
+    ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=device)['model'], strict=False)
     ppo.eval()
 
     scene, robot, cam_brain, act_dofs, q0 = init_genesis_scene(device)

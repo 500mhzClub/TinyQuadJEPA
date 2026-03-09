@@ -1,0 +1,18 @@
+{
+  "jepa_ckpt": "jepa_checkpoints/jepa_epoch_8_step_3000.pt",
+  "ppo_ckpt": "runs/pupper_omni_20260225_150134/ckpt_20000.pt",
+  "epoch": 8,
+  "step": 3000,
+  "steps_budget": 600,
+  "steps_taken": 600,
+  "completed": false,
+  "waypoints_total": 7,
+  "waypoints_reached": 3,
+  "waypoint_fraction": 0.42857142857142855,
+  "replans": 120,
+  "final_goal_dist": 0.26299360394477844,
+  "mean_latent_cost": 0.7891403526067734,
+  "mean_goal_dist": 0.18007132971736914,
+  "min_clearance": 0.14440155029296875,
+  "video_path": "eval_output.mp4"
+}

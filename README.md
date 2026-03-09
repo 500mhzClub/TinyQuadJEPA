@@ -367,29 +367,8 @@ Add:
 - goal-conditioned energy planning
 - command-sequence planning
 
-At that point, the system can honestly be presented as a **JEPA + learned energy-based planner**.
+At that point, the system can be presented as a **JEPA + learned energy-based planner**.
 
----
-
-## Practical answer to “what should I do next?”
-
-Yes: **finish the current run, make the demos, and then move to a more canonical JEPA**.
-
-Why this is the right move:
-
-- you already have healthy enough metrics to justify completing the run
-- you need a stable baseline before changing the method family
-- demos are valuable for motivation, presentations, and debugging
-- switching architectures mid-run would muddy the story and remove your reference point
-
-The current version is already good enough to be a strong:
-
-- proof of concept
-- baseline latent planner
-- demo platform
-- stepping stone to a more canonical JEPA / EBM design
-
----
 
 ## One-line project description
 

@@ -10,7 +10,7 @@ than to shuffled in-batch negatives.
 
 Example:
     python JEPA/train_energy_head.py \
-        --jepa_ckpt jepa_checkpoints/jepa_epoch_8_step_3000.pt \
+        --jepa_ckpt jepa_checkpoints/jepa_epoch_20.pt \
         --data_dir jepa_final_dataset \
         --device cuda
 """
@@ -312,22 +312,19 @@ def rollout_terminal_latent(
     return z_roll, z_goal
 
 
-def sample_negative_goals(z_goal: torch.Tensor, num_negatives: int, rng: random.Random) -> torch.Tensor:
+def sample_negative_goals(z_goal: torch.Tensor, num_negatives: int) -> torch.Tensor:
+    """Pure PyTorch vectorized negative sampling to avoid CPU-GPU syncs."""
     bsz = z_goal.shape[0]
-    device = z_goal.device
-    base = list(range(bsz))
-    perms = []
-    for _ in range(num_negatives):
-        perm = base[:]
-        rng.shuffle(perm)
-        if bsz > 1:
-            fixed = sum(int(i == p) for i, p in enumerate(perm))
-            if fixed > bsz // 8:
-                perm = perm[1:] + perm[:1]
-        perms.append(torch.tensor(perm, device=device, dtype=torch.long))
-    idx = torch.stack(perms, dim=0)   # [K, B]
-    neg = z_goal[idx]                  # [K, B, D]
-    return neg.permute(1, 0, 2).contiguous()  # [B, K, D]
+    if bsz <= 1:
+        return z_goal.unsqueeze(1).expand(-1, num_negatives, -1)
+    
+    # Generate random offsets in [1, bsz-1] to strictly avoid positive pairs (index i == i)
+    offsets = torch.randint(1, bsz, (bsz, num_negatives), device=z_goal.device)
+    base_idx = torch.arange(bsz, device=z_goal.device).unsqueeze(1)
+    
+    # Add offset and wrap around batch size
+    neg_idx = (base_idx + offsets) % bsz
+    return z_goal[neg_idx]  # [B, K, D]
 
 
 def energy_ranking_loss(
@@ -370,10 +367,13 @@ def run_validation(
     reg_weight: float,
     amp_enabled: bool,
     max_batches: int,
-    seed: int,
 ) -> StepStats:
     head.eval()
-    rng = random.Random(seed)
+    
+    # Prevent eval mode leak if freeze_backbone was set to False
+    backbone_was_training = backbone.training
+    backbone.eval()
+    
     losses: List[float] = []
     pos_vals: List[float] = []
     neg_vals: List[float] = []
@@ -393,7 +393,7 @@ def run_validation(
 
         with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
             z_pred, z_goal = rollout_terminal_latent(backbone, vis, prop, cmds, horizon)
-            z_neg = sample_negative_goals(z_goal, num_negatives, rng)
+            z_neg = sample_negative_goals(z_goal, num_negatives)
             _, stats = energy_ranking_loss(head, z_pred, z_goal, z_neg, margin, reg_weight)
 
         losses.append(stats.loss)
@@ -401,6 +401,9 @@ def run_validation(
         neg_vals.append(stats.neg_energy)
         gaps.append(stats.gap)
         accs.append(stats.ranking_acc)
+        
+    if backbone_was_training:
+        backbone.train()
 
     if not losses:
         return StepStats(math.nan, math.nan, math.nan, math.nan, math.nan)
@@ -551,19 +554,18 @@ def main() -> None:
             cmds = cmds.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            rng = random.Random(args.seed + global_step)
 
             if args.freeze_backbone:
                 with torch.no_grad():
                     with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                         z_pred, z_goal = rollout_terminal_latent(backbone, vis, prop, cmds, args.horizon)
                 with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-                    z_neg = sample_negative_goals(z_goal, args.num_negatives, rng)
+                    z_neg = sample_negative_goals(z_goal, args.num_negatives)
                     loss, stats = energy_ranking_loss(head, z_pred, z_goal, z_neg, args.margin, args.reg_weight)
             else:
                 with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                     z_pred, z_goal = rollout_terminal_latent(backbone, vis, prop, cmds, args.horizon)
-                    z_neg = sample_negative_goals(z_goal.detach(), args.num_negatives, rng)
+                    z_neg = sample_negative_goals(z_goal.detach(), args.num_negatives)
                     loss, stats = energy_ranking_loss(head, z_pred, z_goal, z_neg, args.margin, args.reg_weight)
 
             scaler.scale(loss).backward()
@@ -623,7 +625,6 @@ def main() -> None:
             reg_weight=args.reg_weight,
             amp_enabled=amp_enabled,
             max_batches=args.val_batches,
-            seed=args.seed + epoch,
         )
 
         with open(csv_path, "a", newline="") as f:

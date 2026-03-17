@@ -199,6 +199,40 @@ What is still incomplete:
 - no explicit offline benchmark suite for multi-step prediction quality
 - planning still samples command families rather than running a stronger optimizer
 
+## Conclusions & Limitations
+
+This project was a v1 learning exercise. Here is what it taught and where it falls short.
+
+### What worked
+
+The genesis_eval demo is genuine: a latent world model plans in representation space, scores futures with a learned energy head, and drives a quadruped through a beacon route in closed loop. The VICReg backbone learns useful representations for open-floor navigation, and the energy landscape shows a meaningful basin of attraction around goal latents.
+
+### What didn't work
+
+The exploration demo (explore_demo.py) could not be salvaged. The core problem is not planner tuning — it is missing training distribution. The model was trained exclusively on flat, obstacle-free trajectories. Near obstacles every latent is out-of-distribution, the predictor's rollouts are unreliable, and no amount of cost-function adjustment can compensate for a model that has never seen the states it is being asked to reason about.
+
+### Architectural debt
+
+- **VICReg instead of canonical JEPA.** The variance and covariance terms prevent collapse but add complexity and sensitivity to weight ratios. A student-teacher architecture with EMA target encoder achieves the same goal more simply (proven by BYOL, DINO, I-JEPA).
+- **No masked prediction.** Canonical JEPA masks patches and predicts their representations from context. This project predicts entire next-step latents, which is a weaker learning signal.
+- **Single-texture flat-floor data.** The visual encoder overfits to the checkerboard ground plane. Real deployment needs diverse textures and obstacle appearances.
+
+### What was learned
+
+- How to train action-conditioned latent dynamics models at scale (streaming HDF5, torch.compile, bfloat16 AMP, 2K batch size)
+- How energy-based models can serve as planning objectives in latent space
+- How MPC over sampled command sequences works in practice (candidate scoring, elite filtering)
+- Why training distribution matters more than planner sophistication — a model that has never seen obstacle states cannot plan around obstacles, regardless of how clever the cost function is
+
+### Next steps
+
+The successor project ([TinyQuadJEPA-v2](../TinyQuadJEPA-v2/)) addresses these limitations:
+
+- Canonical student-teacher JEPA with EMA target encoder
+- Training data with randomly placed obstacles and collision detection
+- Visual diversity: multiple ground textures, obstacle colors, expanded domain randomization
+- Shared `tqjepa/` Python package eliminating model class duplication across scripts
+
 ## Notes
 
 - The top-level README is intended to be the authoritative overview for the current code.

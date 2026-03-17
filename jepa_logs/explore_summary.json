@@ -1,0 +1,23 @@
+{
+  "jepa_ckpt": "jepa_checkpoints/jepa_epoch_20.pt",
+  "ppo_ckpt": "runs/pupper_omni_20260225_150134/ckpt_20000.pt",
+  "steps_budget": 1800,
+  "steps_taken": 1800,
+  "coverage_goal": 55.0,
+  "final_coverage_pct": 32.71,
+  "goal_reached": false,
+  "free_cells": 16,
+  "occupied_cells": 671,
+  "frontier_switches": 117,
+  "frontier_blacklisted": 262,
+  "recovery_episodes": 0,
+  "wander_episodes": 0,
+  "mean_step_time_s": 0.52,
+  "fps": 1.9,
+  "coverage_milestones": {
+    "step_at_10pct": 268,
+    "step_at_20pct": 500,
+    "step_at_30pct": 597
+  },
+  "video_path": "jepa_logs/explore_demo.mp4"
+}

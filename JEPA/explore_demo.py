@@ -2,29 +2,25 @@
 from __future__ import annotations
 
 """
-Fast JEPA exploration demo with obstacle navigation.
+JEPA exploration demo (sensor-frontier navigation)
 
-What changed vs the original explore demo:
-- replaces heavy 320x5 CEM with a very small local candidate set around a path-following command
-- adds a global frontier path planner on the occupancy grid so the robot stops trying to drive through walls
-- calibrates latent OOD against the safe-bank distribution instead of using raw kNN distance directly
-- replans every few steps instead of every single step
-- marks visited cells along the travelled segment, not just at the instantaneous pose
-- makes the output frame size divisible by 16 to avoid ffmpeg resizing
-
-Design intent:
-- obstacle avoidance comes primarily from explicit geometry + grid path planning
-- JEPA OOD is used as a *risk gate / speed limiter*, not the main reward signal
-- PPO gait still provides low-level execution
+Key properties:
+- Does NOT preload obstacle boxes into the planner/map.
+- Builds a local/world occupancy estimate only from what the robot camera sees.
+- Uses JEPA latent rollout + safe-bank OOD as a soft exploration prior.
+- Uses PPO as the low-level gait controller.
+- Includes stuck detection + short recovery maneuvers.
+- Robust camera parsing for Genesis render outputs that may contain None entries.
 """
 
 import argparse
-import heapq
+import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import imageio
 import numpy as np
@@ -34,10 +30,21 @@ from PIL import Image, ImageDraw
 import genesis as gs
 
 
-# ----------------------------------------------------------------------------
-# Models
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# World / map constants
+# -----------------------------------------------------------------------------
 
+WORLD_MIN = np.array([-2.2, -1.2], dtype=np.float32)
+WORLD_MAX = np.array([3.8, 3.8], dtype=np.float32)
+
+MAP_UNKNOWN = -1
+MAP_FREE = 0
+MAP_OCC = 1
+
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int = 50, act_dim: int = 12, hid: int = 256):
@@ -99,13 +106,17 @@ class JointEncoder(nn.Module):
         )
 
     def forward(self, vision: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-        return self.fusion(torch.cat([self.vis_enc(vision), self.prop_enc(proprio)], dim=-1))
+        z = torch.cat([self.vis_enc(vision), self.prop_enc(proprio)], dim=-1)
+        return self.fusion(z)
 
 
 class LatentPredictor(nn.Module):
     def __init__(self, latent_dim: int = 256, cmd_dim: int = 3):
         super().__init__()
-        self.input_proj = nn.Sequential(nn.Linear(latent_dim + cmd_dim, latent_dim), nn.ELU())
+        self.input_proj = nn.Sequential(
+            nn.Linear(latent_dim + cmd_dim, latent_dim),
+            nn.ELU(),
+        )
         self.rnn = nn.GRUCell(latent_dim, latent_dim)
         self.output_proj = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.ELU(),
@@ -115,7 +126,8 @@ class LatentPredictor(nn.Module):
     def forward(self, z_t: torch.Tensor, c_t: torch.Tensor, h_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.input_proj(torch.cat([z_t, c_t], dim=-1))
         h_next = self.rnn(x, h_t)
-        return self.output_proj(h_next), h_next
+        z_next = self.output_proj(h_next)
+        return z_next, h_next
 
 
 class TinyQuadJEPA(nn.Module):
@@ -126,56 +138,45 @@ class TinyQuadJEPA(nn.Module):
         self.predictor = LatentPredictor(latent_dim, 3)
 
 
-# ----------------------------------------------------------------------------
-# Specs / utilities
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Dataclasses
+# -----------------------------------------------------------------------------
 
-
-@dataclass(frozen=True)
+@dataclass
 class ObstacleSpec:
-    name: str
-    pos: np.ndarray
-    size: np.ndarray
-    color_rgb: Tuple[float, float, float]
+    pos: Tuple[float, float, float]
+    size: Tuple[float, float, float]
 
 
 @dataclass
-class FrontierTarget:
-    cell: Tuple[int, int]
-    xy: np.ndarray
+class SensorMap:
+    grid: np.ndarray
+    free_visits: np.ndarray
+    res: float
+
+    @property
+    def h(self) -> int:
+        return int(self.grid.shape[0])
+
+    @property
+    def w(self) -> int:
+        return int(self.grid.shape[1])
 
 
-@dataclass
-class OODStats:
-    mean: float
-    std: float
-    p90: float
-    p95: float
-    p99: float
-
-
-@dataclass
-class PlannerState:
-    frontier: Optional[FrontierTarget] = None
-    path_cells: Optional[List[Tuple[int, int]]] = None
-    waypoint_xy: Optional[np.ndarray] = None
-    cmd: Optional[torch.Tensor] = None
-    best_path_xy: Optional[np.ndarray] = None
-    hold_steps: int = 0
-    stall_count: int = 0
-    frontier_switches: int = 0
-
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
 
 def clean_state_dict(d: dict) -> dict:
     return {k.replace("_orig_mod.", ""): v for k, v in d.items()}
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
+    return max(lo, min(x, hi))
 
 
 def wrap_to_pi(x: float) -> float:
-    return (x + np.pi) % (2.0 * np.pi) - np.pi
+    return (x + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def yaw_to_quat(yaw_rad: float) -> np.ndarray:
@@ -205,48 +206,182 @@ def create_checkerboard(path: str = "dense_checker.png") -> str:
     return os.path.abspath(path)
 
 
+def make_obstacles() -> List[ObstacleSpec]:
+    return [
+        ObstacleSpec((1.20, 0.20, 0.25), (0.25, 1.10, 0.50)),
+        ObstacleSpec((2.20, 1.40, 0.25), (0.25, 1.00, 0.50)),
+        ObstacleSpec((0.40, 2.20, 0.25), (1.10, 0.25, 0.50)),
+        ObstacleSpec((2.90, 2.80, 0.25), (0.90, 0.25, 0.50)),
+        ObstacleSpec((1.80, 3.10, 0.25), (0.25, 0.90, 0.50)),
+        ObstacleSpec((0.20, 0.80, 0.25), (0.25, 0.80, 0.50)),
+        ObstacleSpec((3.20, 0.40, 0.25), (0.25, 0.90, 0.50)),
+        ObstacleSpec((3.20, 1.90, 0.25), (0.90, 0.25, 0.50)),
+        ObstacleSpec((1.20, 1.60, 0.25), (0.70, 0.25, 0.50)),
+        ObstacleSpec((2.40, 0.70, 0.25), (0.70, 0.25, 0.50)),
+    ]
+
+
 def to_genesis_target(x: torch.Tensor) -> torch.Tensor:
     x_np = x.detach().to("cpu").numpy().astype(np.float32, copy=True)
     return torch.tensor(x_np, device=gs.device, dtype=torch.float32)
 
 
-# ----------------------------------------------------------------------------
-# World config
-# ----------------------------------------------------------------------------
+def to_numpy(x):
+    if x is None:
+        return None
+    if hasattr(x, "detach"):
+        x = x.detach()
+    if hasattr(x, "cpu"):
+        x = x.cpu().numpy()
+    return np.asarray(x)
 
 
-WORLD_MIN = np.array([-2.20, -1.20], dtype=np.float32)
-WORLD_MAX = np.array([3.80, 3.80], dtype=np.float32)
-MAP_W = 60
-MAP_H = 50
-NEIGHBORS_8 = [
-    (-1, -1), (0, -1), (1, -1),
-    (-1, 0),           (1, 0),
-    (-1, 1),  (0, 1),  (1, 1),
-]
+def nearest_bank_distance(z: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
+    # z: [B, D] or [D], bank: [N, D]
+    if z.dim() == 1:
+        z = z.unsqueeze(0)
+    d = torch.cdist(z, bank)
+    return d.min(dim=1).values
 
 
-def make_obstacles() -> List[ObstacleSpec]:
-    return [
-        ObstacleSpec("wall_a", np.array([0.55, 0.25, 0.45], dtype=np.float32), np.array([0.18, 1.90, 0.90], dtype=np.float32), (0.72, 0.36, 0.18)),
-        ObstacleSpec("wall_b", np.array([1.55, 2.55, 0.45], dtype=np.float32), np.array([0.18, 1.80, 0.90], dtype=np.float32), (0.72, 0.36, 0.18)),
-        ObstacleSpec("wall_c", np.array([2.65, 1.05, 0.45], dtype=np.float32), np.array([0.18, 1.70, 0.90], dtype=np.float32), (0.72, 0.36, 0.18)),
-        ObstacleSpec("bar_a", np.array([1.75, 0.95, 0.45], dtype=np.float32), np.array([1.15, 0.18, 0.90], dtype=np.float32), (0.18, 0.45, 0.75)),
-        ObstacleSpec("bar_b", np.array([0.10, 1.95, 0.45], dtype=np.float32), np.array([1.15, 0.18, 0.90], dtype=np.float32), (0.18, 0.45, 0.75)),
-        ObstacleSpec("bar_c", np.array([2.45, 3.00, 0.45], dtype=np.float32), np.array([1.00, 0.18, 0.90], dtype=np.float32), (0.18, 0.45, 0.75)),
-        ObstacleSpec("box_a", np.array([-0.55, 0.75, 0.35], dtype=np.float32), np.array([0.45, 0.45, 0.70], dtype=np.float32), (0.75, 0.72, 0.22)),
-        ObstacleSpec("box_b", np.array([1.05, 1.85, 0.35], dtype=np.float32), np.array([0.50, 0.50, 0.70], dtype=np.float32), (0.75, 0.72, 0.22)),
-        ObstacleSpec("box_c", np.array([2.95, 2.05, 0.35], dtype=np.float32), np.array([0.50, 0.50, 0.70], dtype=np.float32), (0.75, 0.72, 0.22)),
-        ObstacleSpec("box_d", np.array([0.10, 3.15, 0.35], dtype=np.float32), np.array([0.55, 0.55, 0.70], dtype=np.float32), (0.75, 0.72, 0.22)),
-    ]
+def pairwise_nn_stats(bank: torch.Tensor) -> Dict[str, float]:
+    d = torch.cdist(bank, bank)
+    eye = torch.eye(d.shape[0], device=d.device, dtype=torch.bool)
+    d = d.masked_fill(eye, float("inf"))
+    nn = d.min(dim=1).values.detach().cpu().numpy()
+    return {
+        "mean": float(np.mean(nn)),
+        "p50": float(np.percentile(nn, 50)),
+        "p90": float(np.percentile(nn, 90)),
+        "p95": float(np.percentile(nn, 95)),
+        "p99": float(np.percentile(nn, 99)),
+    }
 
 
-# ----------------------------------------------------------------------------
-# Scene + observation helpers
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Map helpers
+# -----------------------------------------------------------------------------
+
+def make_sensor_map(res: float) -> SensorMap:
+    w = int(math.ceil((WORLD_MAX[0] - WORLD_MIN[0]) / res))
+    h = int(math.ceil((WORLD_MAX[1] - WORLD_MIN[1]) / res))
+    return SensorMap(
+        grid=np.full((h, w), MAP_UNKNOWN, dtype=np.int8),
+        free_visits=np.zeros((h, w), dtype=np.int32),
+        res=float(res),
+    )
 
 
-def init_scene(device: torch.device, obstacles: Sequence[ObstacleSpec], start_xy: Tuple[float, float] = (0.0, 0.0)):
+def world_to_grid(sm: SensorMap, xy: np.ndarray) -> Optional[Tuple[int, int]]:
+    gx = int((float(xy[0]) - float(WORLD_MIN[0])) / sm.res)
+    gy = int((float(xy[1]) - float(WORLD_MIN[1])) / sm.res)
+    if 0 <= gx < sm.w and 0 <= gy < sm.h:
+        return gy, gx
+    return None
+
+
+def grid_to_world(sm: SensorMap, rc: Tuple[int, int]) -> np.ndarray:
+    r, c = int(rc[0]), int(rc[1])
+    x = float(WORLD_MIN[0]) + (c + 0.5) * sm.res
+    y = float(WORLD_MIN[1]) + (r + 0.5) * sm.res
+    return np.array([x, y], dtype=np.float32)
+
+
+def mark_disc(sm: SensorMap, xy: np.ndarray, radius: float, value: int):
+    g = world_to_grid(sm, xy)
+    if g is None:
+        return
+    rr = max(1, int(radius / sm.res))
+    r0, c0 = g
+    for r in range(max(0, r0 - rr), min(sm.h, r0 + rr + 1)):
+        for c in range(max(0, c0 - rr), min(sm.w, c0 + rr + 1)):
+            p = grid_to_world(sm, (r, c))
+            if float(np.linalg.norm(p - xy[:2])) <= radius:
+                if value == MAP_FREE:
+                    if sm.grid[r, c] != MAP_OCC:
+                        sm.grid[r, c] = MAP_FREE
+                        sm.free_visits[r, c] += 1
+                elif value == MAP_OCC:
+                    sm.grid[r, c] = MAP_OCC
+
+
+def sample_cell(sm: SensorMap, xy: np.ndarray) -> int:
+    g = world_to_grid(sm, xy)
+    if g is None:
+        return MAP_OCC
+    return int(sm.grid[g[0], g[1]])
+
+
+def local_unknown_gain(sm: SensorMap, xy: np.ndarray, radius: float = 0.50) -> float:
+    g = world_to_grid(sm, xy)
+    if g is None:
+        return 0.0
+    rr = max(1, int(radius / sm.res))
+    r0, c0 = g
+    unknown = 0
+    for r in range(max(0, r0 - rr), min(sm.h, r0 + rr + 1)):
+        for c in range(max(0, c0 - rr), min(sm.w, c0 + rr + 1)):
+            p = grid_to_world(sm, (r, c))
+            if float(np.linalg.norm(p - xy[:2])) <= radius and sm.grid[r, c] == MAP_UNKNOWN:
+                unknown += 1
+    return float(unknown) * 0.08
+
+
+def local_clearance_penalty(sm: SensorMap, xy: np.ndarray, radius: float = 0.25) -> float:
+    g = world_to_grid(sm, xy)
+    if g is None:
+        return 10.0
+    rr = max(1, int(radius / sm.res))
+    r0, c0 = g
+    occ = 0
+    for r in range(max(0, r0 - rr), min(sm.h, r0 + rr + 1)):
+        for c in range(max(0, c0 - rr), min(sm.w, c0 + rr + 1)):
+            p = grid_to_world(sm, (r, c))
+            if float(np.linalg.norm(p - xy[:2])) <= radius and sm.grid[r, c] == MAP_OCC:
+                occ += 1
+    return 0.35 * float(occ)
+
+
+def coverage_percent(sm: SensorMap) -> float:
+    known = np.count_nonzero(sm.grid != MAP_UNKNOWN)
+    return 100.0 * float(known) / float(sm.grid.size)
+
+
+def free_cell_count(sm: SensorMap) -> int:
+    return int(np.count_nonzero(sm.grid == MAP_FREE))
+
+
+def occ_cell_count(sm: SensorMap) -> int:
+    return int(np.count_nonzero(sm.grid == MAP_OCC))
+
+
+# -----------------------------------------------------------------------------
+# Genesis scene / obs / rendering
+# -----------------------------------------------------------------------------
+
+def resolve_sim_backend(sim_backend_arg: str):
+    sim_backend_arg = sim_backend_arg.lower().strip()
+    gpu_backend = getattr(gs, "gpu", getattr(gs, "cuda", None))
+
+    if sim_backend_arg in ("cpu",):
+        return gs.cpu, "CPU requested"
+    if sim_backend_arg in ("gpu", "cuda"):
+        return gpu_backend if gpu_backend is not None else gs.cpu, "GPU requested"
+    if sim_backend_arg == "auto":
+        if gpu_backend is not None:
+            return gpu_backend, "AUTO requested (GPU preferred)"
+        return gs.cpu, "AUTO requested (CPU fallback)"
+    return gs.cpu, "CPU fallback"
+
+
+def init_genesis_once(sim_backend_arg: str):
+    backend, msg = resolve_sim_backend(sim_backend_arg)
+    print(f"🌍 Initializing Genesis ({msg})...")
+    gs.init(backend=backend)
+    print("ℹ️ Genesis prints the actual backend it selected in its own log line above.")
+
+
+def init_scene(with_obstacles: bool):
     scene = gs.Scene(show_viewer=False)
 
     tex = create_checkerboard()
@@ -256,18 +391,24 @@ def init_scene(device: torch.device, obstacles: Sequence[ObstacleSpec], start_xy
     )
 
     robot = scene.add_entity(
-        gs.morphs.URDF(file="assets/mini_pupper/mini_pupper.urdf", pos=(start_xy[0], start_xy[1], 0.12), fixed=False)
+        gs.morphs.URDF(
+            file="assets/mini_pupper/mini_pupper.urdf",
+            pos=(0.0, 0.0, 0.12),
+            fixed=False,
+        )
     )
 
-    for obs in obstacles:
-        scene.add_entity(
-            gs.morphs.Box(pos=tuple(float(x) for x in obs.pos), size=tuple(float(x) for x in obs.size), fixed=True),
-            surface=gs.surfaces.Rough(color=obs.color_rgb),
-        )
+    if with_obstacles:
+        for obs in make_obstacles():
+            scene.add_entity(
+                gs.morphs.Box(pos=obs.pos, size=obs.size, fixed=True),
+                surface=gs.surfaces.Rough(color=(0.55, 0.55, 0.60)),
+            )
 
-    cb = scene.add_camera(res=(64, 64), fov=50)
-    ce = scene.add_camera(res=(384, 384), fov=50)
-    c3 = scene.add_camera(res=(512, 512), fov=50)
+    cam_brain = scene.add_camera(res=(64, 64), fov=58)
+    cam_eye = scene.add_camera(res=(384, 384), fov=58)
+    cam_over = scene.add_camera(res=(512, 512), fov=55)
+
     scene.build()
 
     joint_names = [
@@ -282,426 +423,432 @@ def init_scene(device: torch.device, obstacles: Sequence[ObstacleSpec], start_xy
         0.85, 0.85, 0.85, 0.85,
         -1.75, -1.75, -1.75, -1.75,
     ], dtype=np.float32)
-    q0 = torch.tensor(q0_np, device=device)
 
-    robot.set_pos(np.array([start_xy[0], start_xy[1], 0.12], dtype=np.float32))
+    robot.set_pos(np.array([0.0, 0.0, 0.12], dtype=np.float32))
     robot.set_quat(yaw_to_quat(0.0))
     robot.set_dofs_position(q0_np, dofs)
     robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs)
     robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs)
 
-    for _ in range(12):
-        scene.step()
-
-    return scene, robot, cb, ce, c3, dofs, q0
+    return scene, robot, cam_brain, cam_eye, cam_over, dofs, q0_np
 
 
-def get_sys1_obs(r, q0: torch.Tensor, p_a: torch.Tensor, cmd: torch.Tensor, dofs, dev: torch.device) -> torch.Tensor:
-    p = r.get_pos().to(dev)
-    q = r.get_quat().to(dev)
-    v = r.get_vel().to(dev)
-    a = r.get_ang().to(dev)
-    p, q, v, a = [x.unsqueeze(0) if x.dim() == 1 else x for x in (p, q, v, a)]
-
-    q_c = torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
-
-    def qm(qa: torch.Tensor, qb: torch.Tensor) -> torch.Tensor:
-        return torch.stack([
-            qa[:, 0] * qb[:, 0] - qa[:, 1] * qb[:, 1] - qa[:, 2] * qb[:, 2] - qa[:, 3] * qb[:, 3],
-            qa[:, 0] * qb[:, 1] + qa[:, 1] * qb[:, 0] + qa[:, 2] * qb[:, 3] - qa[:, 3] * qb[:, 2],
-            qa[:, 0] * qb[:, 2] - qa[:, 1] * qb[:, 3] + qa[:, 2] * qb[:, 0] + qa[:, 3] * qb[:, 1],
-            qa[:, 0] * qb[:, 3] + qa[:, 1] * qb[:, 2] - qa[:, 2] * qb[:, 1] + qa[:, 3] * qb[:, 0],
-        ], dim=-1)
-
-    def world_to_body(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
-        return qm(qm(q_c, torch.cat([torch.zeros((vec.shape[0], 1), device=vec.device), vec], dim=-1)), quat)[:, 1:4]
-
-    qd = r.get_dofs_position(dofs).to(dev).unsqueeze(0)
-    dq = r.get_dofs_velocity(dofs).to(dev).unsqueeze(0)
-    return torch.cat([p[:, 2:3], q, world_to_body(q, v), world_to_body(q, a), qd - q0.unsqueeze(0), dq, p_a, cmd], dim=1)
+def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
+    return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
 
 
-@torch.no_grad()
-def get_jepa_state(r, cb, q0: torch.Tensor, pa: torch.Tensor, dofs, dev: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    img = cb.render()[0]
-    if hasattr(img, "cpu"):
-        img = img.cpu().numpy()
-    rgb = np.transpose(img[:, :, :3], (2, 0, 1)).copy()
-    vision = torch.from_numpy(rgb).float().to(dev) / 255.0
-    proprio = get_sys1_obs(r, q0, pa, torch.zeros((1, 3), device=dev), dofs, dev)[:, :47]
-    return vision.unsqueeze(0), proprio
+def quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.stack([
+        a[:, 0] * b[:, 0] - a[:, 1] * b[:, 1] - a[:, 2] * b[:, 2] - a[:, 3] * b[:, 3],
+        a[:, 0] * b[:, 1] + a[:, 1] * b[:, 0] + a[:, 2] * b[:, 3] - a[:, 3] * b[:, 2],
+        a[:, 0] * b[:, 2] - a[:, 1] * b[:, 3] + a[:, 2] * b[:, 0] + a[:, 3] * b[:, 1],
+        a[:, 0] * b[:, 3] + a[:, 1] * b[:, 2] - a[:, 2] * b[:, 1] + a[:, 3] * b[:, 0],
+    ], dim=-1)
 
 
-def move_cams(r, cb, ce, c3):
-    p = r.get_pos().cpu().numpy()
-    q = r.get_quat().cpu().numpy()
+def world_to_body_vec(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    q_conj = quat_conj_wxyz(quat)
+    vq = torch.cat([torch.zeros((vec.shape[0], 1), device=vec.device), vec], dim=-1)
+    return quat_mul_wxyz(quat_mul_wxyz(q_conj, vq), quat)[:, 1:4]
+
+
+def get_sys1_obs(robot, q0: torch.Tensor, prev_action: torch.Tensor, cmd: torch.Tensor, dofs, dev: torch.device) -> torch.Tensor:
+    pos = robot.get_pos().to(dev)
+    quat = robot.get_quat().to(dev)
+    vel = robot.get_vel().to(dev)
+    ang = robot.get_ang().to(dev)
+    pos, quat, vel, ang = [x.unsqueeze(0) if x.dim() == 1 else x for x in (pos, quat, vel, ang)]
+
+    q = robot.get_dofs_position(dofs).to(dev)
+    dq = robot.get_dofs_velocity(dofs).to(dev)
+    q = q.unsqueeze(0) if q.dim() == 1 else q
+    dq = dq.unsqueeze(0) if dq.dim() == 1 else dq
+
+    q0b = q0.unsqueeze(0)
+    obs = torch.cat([
+        pos[:, 2:3],
+        quat,
+        world_to_body_vec(quat, vel),
+        world_to_body_vec(quat, ang),
+        q - q0b,
+        dq,
+        prev_action,
+        cmd,
+    ], dim=1)
+    return obs
+
+
+def move_cams(robot, cam_brain, cam_eye, cam_over):
+    p = robot.get_pos().cpu().numpy()
+    q = robot.get_quat().cpu().numpy()
     if p.ndim > 1:
-        p, q = p[0], q[0]
+        p = p[0]
+    if q.ndim > 1:
+        q = q[0]
+
+    w, x, y, z = q
     fw = np.array([
-        1 - 2 * (q[2] ** 2 + q[3] ** 2),
-        2 * (q[1] * q[2] + q[0] * q[3]),
-        2 * (q[1] * q[3] - q[0] * q[2]),
-    ])
+        1 - 2 * (y ** 2 + z ** 2),
+        2 * (x * y + w * z),
+        2 * (x * z - w * y),
+    ], dtype=np.float32)
     up = np.array([
-        2 * (q[1] * q[3] + q[0] * q[2]),
-        2 * (q[2] * q[3] - q[0] * q[1]),
-        1 - 2 * (q[1] ** 2 + q[2] ** 2),
-    ])
-    cp = p + fw * 0.10 + up * 0.05
-    lk = cp + fw * 1.0
-    for c in (cb, ce):
-        c.set_pose(pos=cp, lookat=lk, up=up)
-    c3p = p - fw * 1.8 + np.array([0.0, 0.0, 0.8])
-    c3l = p + fw * 0.5
-    c3.set_pose(pos=c3p, lookat=c3l, up=np.array([0.0, 0.0, 1.0]))
-    return cp, lk, up, c3p, c3l, np.array([0.0, 0.0, 1.0])
+        2 * (x * z + w * y),
+        2 * (y * z - w * x),
+        1 - 2 * (x ** 2 + y ** 2),
+    ], dtype=np.float32)
+
+    brain_pos = p + fw * 0.10 + up * 0.05
+    brain_lk = brain_pos + fw * 1.00
+
+    cam_brain.set_pose(pos=brain_pos, lookat=brain_lk, up=up)
+    cam_eye.set_pose(pos=brain_pos, lookat=brain_lk, up=up)
+
+    over_pos = p - fw * 1.7 + np.array([0.0, 0.0, 0.9], dtype=np.float32)
+    over_lk = p + fw * 0.45
+    cam_over.set_pose(pos=over_pos, lookat=over_lk, up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+
+    yaw = math.atan2(float(fw[1]), float(fw[0]))
+    return p, yaw, brain_pos, brain_lk
 
 
-def project_world_to_pixel(wp: np.ndarray, cp: np.ndarray, cl: np.ndarray, cu: np.ndarray, fov: float, w: int, h: int):
-    dist = np.linalg.norm(cl - cp)
-    f = (cl - cp) / max(dist, 1e-8)
-    s = np.cross(f, cu / np.linalg.norm(cu))
-    sn = np.linalg.norm(s)
-    if sn < 1e-5:
-        return None
-    s /= sn
-    u = np.cross(s, f)
-    view = np.eye(4)
-    view[0, :3], view[1, :3], view[2, :3] = s, u, -f
-    view[0, 3], view[1, 3], view[2, 3] = -np.dot(s, cp), -np.dot(u, cp), np.dot(f, cp)
-    asp = w / h
-    fy = 1.0 / np.tan(np.radians(fov) / 2.0)
-    proj = np.zeros((4, 4))
-    proj[0, 0], proj[1, 1], proj[2, 2], proj[2, 3], proj[3, 2] = fy / asp, fy, -1.0, -0.02, -1.0
-    pt = np.array([wp[0], wp[1], wp[2], 1.0], dtype=np.float32)
-    clip = proj @ view @ pt
-    if clip[3] <= 0:
-        return None
-    ndc = clip[:3] / clip[3]
-    return int((ndc[0] + 1.0) * 0.5 * w), int((1.0 - ndc[1]) * 0.5 * h)
+def render_rgb_depth(cam):
+    attempts = [
+        lambda: cam.render(rgb=True, depth=True),
+        lambda: cam.render(depth=True),
+        lambda: cam.render(),
+    ]
 
+    out = None
+    last_err = None
+    for fn in attempts:
+        try:
+            out = fn()
+            break
+        except TypeError as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
 
-# ----------------------------------------------------------------------------
-# Safe latent bank harvesting + OOD calibration
-# ----------------------------------------------------------------------------
+    if out is None:
+        raise RuntimeError(f"Camera render failed; last error: {last_err}")
+
+    rgb = None
+    depth = None
+
+    def maybe_take(arr):
+        nonlocal rgb, depth
+        if arr is None:
+            return
+        arr = np.asarray(arr)
+
+        if arr.ndim == 3 and arr.shape[-1] >= 3 and rgb is None:
+            rgb = arr[..., :3]
+            return
+
+        if arr.ndim == 2 and depth is None:
+            depth = arr
+            return
+
+        if arr.ndim == 3 and arr.shape[-1] == 1 and depth is None:
+            depth = arr[..., 0]
+            return
+
+    if isinstance(out, dict):
+        maybe_take(out.get("rgb", None))
+        maybe_take(out.get("color", None))
+        maybe_take(out.get("image", None))
+        maybe_take(out.get("depth", None))
+
+    elif isinstance(out, (tuple, list)):
+        for item in out:
+            if item is None:
+                continue
+            arr = to_numpy(item)
+            maybe_take(arr)
+
+    else:
+        maybe_take(to_numpy(out))
+
+    if rgb is None:
+        raise RuntimeError(
+            f"Could not parse RGB image from Genesis camera render output. "
+            f"Got type={type(out)}"
+        )
+
+    if rgb.dtype != np.uint8:
+        if np.issubdtype(rgb.dtype, np.floating):
+            mx = float(np.nanmax(rgb)) if rgb.size else 1.0
+            if mx <= 1.0:
+                rgb = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                rgb = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+        else:
+            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    if depth is not None:
+        depth = np.asarray(depth, dtype=np.float32)
+
+    return rgb, depth
 
 
 @torch.no_grad()
-def harvest_safe_latent_bank(
+def get_jepa_state(robot, cam_brain, q0: torch.Tensor, prev_action: torch.Tensor, dofs, dev: torch.device):
+    rgb, depth = render_rgb_depth(cam_brain)
+    rgb_chw = np.transpose(rgb[:, :, :3], (2, 0, 1)).copy()
+    vision = torch.from_numpy(rgb_chw).float().to(dev) / 255.0
+    proprio = get_sys1_obs(
+        robot,
+        q0,
+        prev_action,
+        torch.zeros((1, 3), device=dev),
+        dofs,
+        dev,
+    )[:, :47]
+    return vision.unsqueeze(0), proprio, rgb, depth
+
+
+# -----------------------------------------------------------------------------
+# Sensor mapping
+# -----------------------------------------------------------------------------
+
+def normalize_depth(depth: Optional[np.ndarray], depth_max: float) -> Optional[np.ndarray]:
+    if depth is None:
+        return None
+
+    d = np.asarray(depth, dtype=np.float32)
+    if d.ndim == 3 and d.shape[-1] == 1:
+        d = d[..., 0]
+
+    if d.size == 0:
+        return None
+
+    # Heuristic: Genesis sometimes returns metric depth, sometimes normalized depth-like arrays.
+    finite = np.isfinite(d)
+    if not finite.any():
+        return None
+
+    d = np.where(finite, d, np.nan)
+    mx = float(np.nanmax(d))
+    mn = float(np.nanmin(d))
+
+    if mx <= 1.05 and mn >= 0.0:
+        d = np.clip(d, 0.0, 1.0) * depth_max
+    else:
+        d = np.clip(d, 0.0, depth_max)
+
+    return np.nan_to_num(d, nan=depth_max, posinf=depth_max, neginf=0.0).astype(np.float32)
+
+
+def update_sensor_map_from_depth(
+    sm: SensorMap,
+    robot_xy: np.ndarray,
+    robot_yaw: float,
+    depth_img: Optional[np.ndarray],
+    fov_deg: float,
+    depth_max: float,
+    footprint_radius: float = 0.20,
+):
+    mark_disc(sm, robot_xy, footprint_radius, MAP_FREE)
+
+    d = normalize_depth(depth_img, depth_max)
+    if d is None:
+        # Fallback: mark a small free wedge ahead so the map still grows.
+        for a in np.linspace(-0.35, 0.35, 11):
+            ray_yaw = robot_yaw + float(a)
+            for t in np.linspace(0.08, 0.55, 8):
+                p = robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)], dtype=np.float32) * float(t)
+                mark_disc(sm, p, 0.05, MAP_FREE)
+        return
+
+    h, w = d.shape
+    cols = np.linspace(int(0.08 * w), int(0.92 * w), 41).astype(int)
+    cols = np.unique(np.clip(cols, 0, w - 1))
+    row0 = int(0.42 * h)
+    row1 = int(0.88 * h)
+
+    for c in cols:
+        ray = d[row0:row1, c]
+        if ray.size == 0:
+            continue
+
+        dist = float(np.nanmedian(ray))
+        dist = clamp(dist, 0.05, depth_max)
+
+        x_norm = (float(c) / max(float(w - 1), 1.0)) * 2.0 - 1.0
+        ang = math.radians(0.5 * fov_deg) * x_norm
+        ray_yaw = robot_yaw + ang
+
+        # Free cells up to just before the hit.
+        free_until = max(0.0, dist - 0.08)
+        n_steps = max(2, int(free_until / max(sm.res * 0.7, 0.04)))
+        for t in np.linspace(0.06, free_until, n_steps):
+            p = robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)], dtype=np.float32) * float(t)
+            mark_disc(sm, p, 0.04, MAP_FREE)
+
+        # If the ray ends before max range, mark occupied.
+        if dist < depth_max * 0.96:
+            p_occ = robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)], dtype=np.float32) * float(dist)
+            mark_disc(sm, p_occ, 0.08, MAP_OCC)
+
+
+# -----------------------------------------------------------------------------
+# Frontier selection
+# -----------------------------------------------------------------------------
+
+def select_frontier_target(
+    sm: SensorMap,
+    robot_xy: np.ndarray,
+    blacklist: Optional[List[np.ndarray]] = None,
+    blacklist_radius: float = 0.40,
+) -> Tuple[np.ndarray, float]:
+    robot_g = world_to_grid(sm, robot_xy)
+    if robot_g is None:
+        return robot_xy.copy(), 0.0
+
+    bl = blacklist or []
+    candidates: List[Tuple[float, np.ndarray]] = []
+
+    for r in range(1, sm.h - 1):
+        for c in range(1, sm.w - 1):
+            if sm.grid[r, c] != MAP_FREE:
+                continue
+
+            unknown_n = 0
+            occ_n = 0
+            for rr in range(r - 1, r + 2):
+                for cc in range(c - 1, c + 2):
+                    if rr == r and cc == c:
+                        continue
+                    v = int(sm.grid[rr, cc])
+                    if v == MAP_UNKNOWN:
+                        unknown_n += 1
+                    elif v == MAP_OCC:
+                        occ_n += 1
+
+            if unknown_n <= 0:
+                continue
+
+            wp = grid_to_world(sm, (r, c))
+            dist = float(np.linalg.norm(wp - robot_xy))
+            if dist < 0.20:
+                continue
+
+            # Skip blacklisted regions.
+            in_bl = False
+            for bp in bl:
+                if float(np.linalg.norm(wp - bp)) < blacklist_radius:
+                    in_bl = True
+                    break
+            if in_bl:
+                continue
+
+            # Prefer nearby frontiers with lots of unknown — penalise distance.
+            score = 0.45 * float(unknown_n) - 0.30 * dist - 0.35 * float(occ_n)
+            candidates.append((score, wp))
+
+    if not candidates:
+        # If everything is blacklisted, clear blacklist and try any frontier.
+        if bl:
+            return select_frontier_target(sm, robot_xy, blacklist=None)
+        return robot_xy.copy(), 0.0
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    score, wp = candidates[0]
+    return wp, float(score)
+
+
+# -----------------------------------------------------------------------------
+# Latent bank harvesting
+# -----------------------------------------------------------------------------
+
+@torch.no_grad()
+def scene_step_with_policy(
+    scene,
+    robot,
+    q0: torch.Tensor,
+    prev_action: torch.Tensor,
+    cmd: torch.Tensor,
+    dofs,
+    ppo: ActorCritic,
+    dev: torch.device,
+    control_scale: float = 0.30,
+    sim_substeps: int = 4,
+) -> torch.Tensor:
+    obs = get_sys1_obs(robot, q0, prev_action, cmd, dofs, dev)
+    action = ppo.act_deterministic(obs).detach()
+    target = to_genesis_target(q0 + control_scale * action[0])
+    robot.control_dofs_position(target, dofs)
+    for _ in range(sim_substeps):
+        scene.step()
+    return action
+
+
+@torch.no_grad()
+def harvest_safe_bank(
+    scene,
+    robot,
+    cam_brain,
+    q0: torch.Tensor,
+    dofs,
     jepa: TinyQuadJEPA,
     ppo: ActorCritic,
     dev: torch.device,
-    max_latents: int = 128,
-) -> torch.Tensor:
-    bank_scene, bank_robot, bank_cb, _, _, bank_dofs, bank_q0 = init_scene(dev, obstacles=[], start_xy=(0.0, 0.0))
+    n_latents: int = 128,
+):
+    print("🎬 Harvesting open-floor safe latent bank...")
+    prev_action = torch.zeros((1, 12), device=dev)
 
-    positions = [
-        (-0.8, -0.4), (0.0, -0.4), (0.8, -0.4),
-        (-0.8, 0.8), (0.0, 0.8), (0.8, 0.8),
-    ]
-    yaws = [0.0, 0.5 * np.pi, np.pi, -0.5 * np.pi]
-    cmds = [
-        np.array([+0.24, 0.00, 0.00], dtype=np.float32),
-        np.array([+0.20, +0.05, 0.00], dtype=np.float32),
-        np.array([+0.20, -0.05, 0.00], dtype=np.float32),
-        np.array([+0.16, 0.00, +0.20], dtype=np.float32),
-        np.array([+0.16, 0.00, -0.20], dtype=np.float32),
-    ]
+    cmds = []
+    for k in range(n_latents * 3):
+        phase = k % 24
+        if phase < 8:
+            cmd = [0.30, 0.00, 0.00]
+        elif phase < 12:
+            cmd = [0.22, 0.00, 0.30]
+        elif phase < 16:
+            cmd = [0.28, 0.00, -0.30]
+        elif phase < 20:
+            cmd = [0.18, 0.08, 0.10]
+        else:
+            cmd = [0.18, -0.08, -0.10]
+        cmds.append(torch.tensor([cmd], device=dev, dtype=torch.float32))
 
-    latents: List[torch.Tensor] = []
-    pa = torch.zeros((1, 12), device=dev)
+    bank: List[torch.Tensor] = []
+    for k, cmd in enumerate(cmds):
+        p, yaw, _, _ = move_cams(robot, cam_brain, cam_brain, cam_brain)
+        _ = (p, yaw)  # silence lint
+        prev_action = scene_step_with_policy(scene, robot, q0, prev_action, cmd, dofs, ppo, dev)
+        if k % 3 == 0:
+            vis, prop, _, _ = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
+            z = jepa.encoder(vis, prop).detach().squeeze(0)
+            bank.append(z)
+            if len(bank) >= n_latents:
+                break
 
-    for (sx, sy) in positions:
-        for yaw in yaws:
-            bank_robot.set_pos(np.array([sx, sy, 0.12], dtype=np.float32))
-            bank_robot.set_quat(yaw_to_quat(float(yaw)))
-            bank_robot.set_dofs_position(bank_q0.detach().cpu().numpy(), bank_dofs)
-            for _ in range(8):
-                bank_scene.step()
+    bank_t = torch.stack(bank, dim=0)
+    stats = pairwise_nn_stats(bank_t)
 
-            for cmd_np in cmds:
-                cmd = torch.tensor(cmd_np, device=dev, dtype=torch.float32).view(1, 3)
-                for _ in range(4):
-                    obs = get_sys1_obs(bank_robot, bank_q0, pa, cmd, bank_dofs, dev)
-                    pa = ppo.act_deterministic(obs)
-                    target = to_genesis_target(bank_q0 + 0.3 * pa[0])
-                    bank_robot.control_dofs_position(target, bank_dofs)
-                    for _ in range(3):
-                        bank_scene.step()
-                    v, p = get_jepa_state(bank_robot, bank_cb, bank_q0, pa, bank_dofs, dev)
-                    latents.append(jepa.encoder(v, p).detach().squeeze(0))
-                    if len(latents) >= max_latents:
-                        return torch.stack(latents, dim=0)
-
-    return torch.stack(latents, dim=0)
-
-
-def knn_ood_score(z: torch.Tensor, bank: torch.Tensor, k: int = 8) -> torch.Tensor:
-    if z.dim() == 1:
-        z = z.unsqueeze(0)
-    d = torch.cdist(z, bank)
-    k = int(min(k, bank.shape[0]))
-    vals = torch.topk(d, k=k, largest=False).values
-    return vals.mean(dim=-1)
-
-
-@torch.no_grad()
-def calibrate_ood(bank: torch.Tensor, k: int = 8) -> OODStats:
-    d = torch.cdist(bank, bank)
-    n = d.shape[0]
-    diag = torch.eye(n, device=d.device, dtype=torch.bool)
-    d[diag] = float("inf")
-    vals = torch.topk(d, k=min(k, max(n - 1, 1)), largest=False).values.mean(dim=-1)
-    arr = vals.detach().cpu().numpy().astype(np.float32)
-    return OODStats(
-        mean=float(arr.mean()),
-        std=float(arr.std() + 1e-6),
-        p90=float(np.percentile(arr, 90.0)),
-        p95=float(np.percentile(arr, 95.0)),
-        p99=float(np.percentile(arr, 99.0)),
+    print(f"   Safe bank size: {bank_t.shape[0]} latents")
+    print(
+        "   Safe OOD stats: "
+        f"mean={stats['mean']:.2f} p90={stats['p90']:.2f} "
+        f"p95={stats['p95']:.2f} p99={stats['p99']:.2f}"
     )
+    return bank_t, stats
 
 
-def normalize_ood(raw_ood: float, stats: OODStats) -> float:
-    denom = max(stats.p95 - stats.p90, 1e-6)
-    return max(0.0, (float(raw_ood) - stats.p90) / denom)
+# -----------------------------------------------------------------------------
+# Kinematic rollout / local planner
+# -----------------------------------------------------------------------------
 
-
-# ----------------------------------------------------------------------------
-# Grid / frontier helpers
-# ----------------------------------------------------------------------------
-
-
-def world_to_grid(xy: np.ndarray) -> Tuple[int, int]:
-    nx = (float(xy[0]) - float(WORLD_MIN[0])) / max(float(WORLD_MAX[0] - WORLD_MIN[0]), 1e-8)
-    ny = (float(xy[1]) - float(WORLD_MIN[1])) / max(float(WORLD_MAX[1] - WORLD_MIN[1]), 1e-8)
-    gx = int(np.clip(nx * MAP_W, 0, MAP_W - 1))
-    gy = int(np.clip(ny * MAP_H, 0, MAP_H - 1))
-    return gx, gy
-
-
-def grid_to_world(gx: int, gy: int) -> np.ndarray:
-    x = float(WORLD_MIN[0]) + (gx + 0.5) / MAP_W * float(WORLD_MAX[0] - WORLD_MIN[0])
-    y = float(WORLD_MIN[1]) + (gy + 0.5) / MAP_H * float(WORLD_MAX[1] - WORLD_MIN[1])
-    return np.array([x, y], dtype=np.float32)
-
-
-def point_aabb_signed_clearance_xy(xy: np.ndarray, obs: ObstacleSpec, inflate: float = 0.0) -> float:
-    hx = 0.5 * float(obs.size[0]) + float(inflate)
-    hy = 0.5 * float(obs.size[1]) + float(inflate)
-    dx = abs(float(xy[0]) - float(obs.pos[0])) - hx
-    dy = abs(float(xy[1]) - float(obs.pos[1])) - hy
-    outside_dx = max(dx, 0.0)
-    outside_dy = max(dy, 0.0)
-    if dx <= 0.0 and dy <= 0.0:
-        return -min(-dx, -dy)
-    return float(math.hypot(outside_dx, outside_dy))
-
-
-def min_clearance_to_obstacles(xy: np.ndarray, obstacles: Sequence[ObstacleSpec], inflate: float = 0.0) -> float:
-    if not obstacles:
-        return 1e6
-    return min(point_aabb_signed_clearance_xy(xy, obs, inflate=inflate) for obs in obstacles)
-
-
-def build_obstacle_grid(obstacles: Sequence[ObstacleSpec], inflate: float = 0.10) -> Tuple[np.ndarray, np.ndarray]:
-    occ = np.zeros((MAP_H, MAP_W), dtype=bool)
-    clearance = np.zeros((MAP_H, MAP_W), dtype=np.float32)
-    for gy in range(MAP_H):
-        for gx in range(MAP_W):
-            xy = grid_to_world(gx, gy)
-            clr = min_clearance_to_obstacles(xy, obstacles, inflate=inflate)
-            clearance[gy, gx] = float(clr)
-            if clr < 0.0:
-                occ[gy, gx] = True
-    return occ, clearance
-
-
-def mark_visited(visited: np.ndarray, xy: np.ndarray, radius_cells: int = 1):
-    gx, gy = world_to_grid(xy)
-    for dy in range(-radius_cells, radius_cells + 1):
-        for dx in range(-radius_cells, radius_cells + 1):
-            nx = gx + dx
-            ny = gy + dy
-            if 0 <= nx < MAP_W and 0 <= ny < MAP_H:
-                visited[ny, nx] = True
-
-
-def mark_visited_segment(visited: np.ndarray, p0: np.ndarray, p1: np.ndarray, radius_cells: int = 1):
-    dist = float(np.linalg.norm(p1 - p0))
-    n = max(2, int(dist / 0.05) + 1)
-    for t in np.linspace(0.0, 1.0, n):
-        pt = (1.0 - t) * p0 + t * p1
-        mark_visited(visited, pt, radius_cells=radius_cells)
-
-
-def compute_frontier_mask(visited: np.ndarray, occ: np.ndarray) -> np.ndarray:
-    free = ~occ
-    frontier = np.zeros_like(visited, dtype=bool)
-    for gy in range(MAP_H):
-        for gx in range(MAP_W):
-            if occ[gy, gx] or visited[gy, gx]:
-                continue
-            for dx, dy in NEIGHBORS_8:
-                nx = gx + dx
-                ny = gy + dy
-                if 0 <= nx < MAP_W and 0 <= ny < MAP_H and free[ny, nx] and visited[ny, nx]:
-                    frontier[gy, gx] = True
-                    break
-    return frontier
-
-
-def local_unseen_gain(visited: np.ndarray, occ: np.ndarray, gx: int, gy: int, rad: int = 2) -> int:
-    score = 0
-    for dy in range(-rad, rad + 1):
-        for dx in range(-rad, rad + 1):
-            nx = gx + dx
-            ny = gy + dy
-            if 0 <= nx < MAP_W and 0 <= ny < MAP_H and (not occ[ny, nx]) and (not visited[ny, nx]):
-                score += 1
-    return score
-
-
-def compute_distance_field(start: Tuple[int, int], occ: np.ndarray) -> np.ndarray:
-    sx, sy = start
-    dist = np.full((MAP_H, MAP_W), np.inf, dtype=np.float32)
-    if not (0 <= sx < MAP_W and 0 <= sy < MAP_H) or occ[sy, sx]:
-        return dist
-    pq: List[Tuple[float, int, int]] = [(0.0, sx, sy)]
-    dist[sy, sx] = 0.0
-    while pq:
-        d, x, y = heapq.heappop(pq)
-        if d > float(dist[y, x]):
-            continue
-        for dx, dy in NEIGHBORS_8:
-            nx = x + dx
-            ny = y + dy
-            if not (0 <= nx < MAP_W and 0 <= ny < MAP_H):
-                continue
-            if occ[ny, nx]:
-                continue
-            step = 1.4142 if dx != 0 and dy != 0 else 1.0
-            nd = d + step
-            if nd < float(dist[ny, nx]):
-                dist[ny, nx] = nd
-                heapq.heappush(pq, (nd, nx, ny))
-    return dist
-
-
-def choose_frontier_target(visited: np.ndarray, occ: np.ndarray, robot_xy: np.ndarray) -> Optional[FrontierTarget]:
-    """
-    Cheap, deterministic frontier chooser.
-
-    Why this exists:
-    - the earlier version used a full distance-field solve during frontier selection
-    - in practice, that stage appears to be where some runs stall before the first step
-    - for a 60x50 map we do not need anything sophisticated here
-
-    Strategy:
-    1. build the frontier mask
-    2. score frontier cells using only local unseen gain + straight-line distance
-    3. if no frontier exists, fall back to any unvisited free cell
-    4. reject cells too close to obstacles so A* gets cleaner goals
-    """
-    frontier = compute_frontier_mask(visited, occ)
-    cells = np.argwhere(frontier)
-    if len(cells) == 0:
-        cells = np.argwhere((~occ) & (~visited))
-        if len(cells) == 0:
-            return None
-
-    best_cell = None
-    best_score = None
-    for gy, gx in cells:
-        gx_i = int(gx)
-        gy_i = int(gy)
-        if occ[gy_i, gx_i]:
-            continue
-
-        xy = grid_to_world(gx_i, gy_i)
-        euclid = float(np.linalg.norm(xy - robot_xy))
-        gain = float(local_unseen_gain(visited, occ, gx_i, gy_i, rad=2))
-
-        # Avoid selecting cells that sit right on obstacle margins.
-        obs_clear = float(min_clearance_to_obstacles(xy, make_obstacles(), inflate=0.10))
-        if obs_clear < 0.02:
-            continue
-
-        score = 2.8 * gain - 0.55 * euclid + 0.15 * obs_clear
-        if best_score is None or score > best_score:
-            best_score = score
-            best_cell = (gx_i, gy_i)
-
-    if best_cell is None:
-        return None
-    return FrontierTarget(cell=best_cell, xy=grid_to_world(best_cell[0], best_cell[1]))
-
-
-def reconstruct_path(came_from: Dict[Tuple[int, int], Tuple[int, int]], goal: Tuple[int, int]) -> List[Tuple[int, int]]:
-    cur = goal
-    path = [cur]
-    while cur in came_from:
-        cur = came_from[cur]
-        path.append(cur)
-    path.reverse()
-    return path
-
-
-def astar_path(
-    start: Tuple[int, int],
-    goal: Tuple[int, int],
-    occ: np.ndarray,
-    clearance: np.ndarray,
-) -> Optional[List[Tuple[int, int]]]:
-    sx, sy = start
-    gx, gy = goal
-    if occ[sy, sx] or occ[gy, gx]:
-        return None
-
-    pq: List[Tuple[float, float, int, int]] = []
-    came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
-    g_cost: Dict[Tuple[int, int], float] = {(sx, sy): 0.0}
-
-    def heuristic(x: int, y: int) -> float:
-        return float(math.hypot(gx - x, gy - y))
-
-    heapq.heappush(pq, (heuristic(sx, sy), 0.0, sx, sy))
-
-    while pq:
-        _, cur_g, x, y = heapq.heappop(pq)
-        if (x, y) == (gx, gy):
-            return reconstruct_path(came_from, (gx, gy))
-        if cur_g > g_cost.get((x, y), float("inf")):
-            continue
-
-        for dx, dy in NEIGHBORS_8:
-            nx = x + dx
-            ny = y + dy
-            if not (0 <= nx < MAP_W and 0 <= ny < MAP_H):
-                continue
-            if occ[ny, nx]:
-                continue
-            step = 1.4142 if dx != 0 and dy != 0 else 1.0
-            clr = float(clearance[ny, nx])
-            clr_pen = 0.0
-            if clr < 0.12:
-                clr_pen += (0.12 - clr) * 3.5
-            if clr < 0.22:
-                clr_pen += (0.22 - clr) * 0.8
-            nd = cur_g + step + clr_pen
-            if nd < g_cost.get((nx, ny), float("inf")):
-                g_cost[(nx, ny)] = nd
-                came_from[(nx, ny)] = (x, y)
-                heapq.heappush(pq, (nd + heuristic(nx, ny), nd, nx, ny))
-    return None
-
-
-# ----------------------------------------------------------------------------
-# Planning
-# ----------------------------------------------------------------------------
-
-
-def rollout_cmd_kinematic(start_xy: np.ndarray, start_yaw: float, cmd_xyw: np.ndarray, hz: int, dt: float = 0.10):
+def rollout_cmd_kinematic(
+    start_xy: np.ndarray,
+    start_yaw: float,
+    cmd_xyw: np.ndarray,
+    hz: int,
+    dt: float = 0.10,
+) -> Tuple[np.ndarray, np.ndarray, float]:
     pos = np.array(start_xy, dtype=np.float32).copy()
     yaw = float(start_yaw)
     path = []
@@ -710,186 +857,188 @@ def rollout_cmd_kinematic(start_xy: np.ndarray, start_yaw: float, cmd_xyw: np.nd
         world_v = body_to_world_xy(yaw, cmd_xyw[:2])
         pos += dt * world_v
         yaw = wrap_to_pi(yaw + dt * float(cmd_xyw[2]))
-    return np.stack(path, axis=0), pos, yaw
+    return np.stack(path, axis=0), pos.copy(), float(yaw)
 
 
-def choose_waypoint_from_path(path_cells: List[Tuple[int, int]], robot_xy: np.ndarray, lookahead: int) -> np.ndarray:
-    if len(path_cells) <= 1:
-        return robot_xy.copy()
-    idx = min(lookahead, len(path_cells) - 1)
-    gx, gy = path_cells[idx]
-    return grid_to_world(gx, gy)
+def path_collision_penalty(sm: SensorMap, path_xy: np.ndarray) -> float:
+    pen = 0.0
+    for pt in path_xy:
+        cell = sample_cell(sm, pt)
+        if cell == MAP_OCC:
+            pen += 1.8
+        # Unknown is not punished: the map is sensor-built only.
+        pen += local_clearance_penalty(sm, pt, radius=0.18) * 0.25
+    return float(pen)
 
 
 @torch.no_grad()
-def predict_cmd_ood(
+def plan_local_cmd(
     jepa: TinyQuadJEPA,
     zc: torch.Tensor,
-    cmd: torch.Tensor,
-    horizon: int,
-) -> torch.Tensor:
-    z_roll = zc.clone()
-    h_t = torch.zeros((z_roll.shape[0], jepa.latent_dim), device=zc.device, dtype=zc.dtype)
-    for _ in range(horizon):
-        z_roll, h_t = jepa.predictor(z_roll, cmd, h_t)
-    return z_roll
-
-
-@torch.no_grad()
-def choose_local_cmd(
-    jepa: TinyQuadJEPA,
     safe_bank: torch.Tensor,
-    ood_stats: OODStats,
-    zc: torch.Tensor,
+    safe_stats: Dict[str, float],
+    sm: SensorMap,
     robot_xy: np.ndarray,
     robot_yaw: float,
-    waypoint_xy: np.ndarray,
     frontier_xy: np.ndarray,
-    current_ood_rel: float,
-    visited: np.ndarray,
-    occ: np.ndarray,
-    obstacles: Sequence[ObstacleSpec],
     prev_cmd: Optional[torch.Tensor],
-    cmd_horizon: int,
-    rollout_horizon: int,
-) -> Tuple[torch.Tensor, Dict[str, float], np.ndarray]:
-    goal_vec_w = waypoint_xy - robot_xy
-    goal_body = world_to_body_xy(robot_yaw, goal_vec_w)
-    dist_wp = float(np.linalg.norm(goal_vec_w))
-    heading_err = math.atan2(float(goal_body[1]), float(goal_body[0]) + 1e-8)
+    cands: int,
+    hz: int,
+    dev: torch.device,
+):
+    goal_vec = frontier_xy - robot_xy
+    goal_dist = float(np.linalg.norm(goal_vec))
+    if goal_dist < 1e-6:
+        return torch.zeros((1, 3), device=dev), {
+            "path": np.zeros((hz, 2), dtype=np.float32),
+            "frontier": 0.0,
+            "OODraw": 0.0,
+            "OODrel": 0.0,
+            "novel": 0,
+            "prog": 0.0,
+            "cost": 0.0,
+        }
 
-    speed_scale = 1.0 / (1.0 + 0.55 * current_ood_rel)
-    max_vx = 0.28 * speed_scale + 0.04
-    max_vy = 0.20 * speed_scale + 0.03
-    max_wz = 0.55 * speed_scale + 0.10
+    goal_dir_world = goal_vec / max(goal_dist, 1e-8)
+    goal_body_xy = world_to_body_xy(robot_yaw, goal_dir_world)
+    goal_angle = math.atan2(float(goal_vec[1]), float(goal_vec[0]))
+    heading_error = wrap_to_pi(goal_angle - robot_yaw)
 
-    base = np.array([
-        clamp(0.95 * float(goal_body[0]), -max_vx, max_vx),
-        clamp(0.95 * float(goal_body[1]), -max_vy, max_vy),
-        clamp(0.85 * heading_err, -max_wz, max_wz),
-    ], dtype=np.float32)
+    far = goal_dist > 0.8
+    transl_scale = 0.28 if far else 0.18
+    if abs(heading_error) > 0.9:
+        transl_scale *= 0.50
 
-    if dist_wp < 0.18:
-        base[0] *= 0.6
-        base[1] *= 0.6
-        base[2] *= 0.7
+    mean = torch.tensor([
+        clamp(float(goal_body_xy[0]) * transl_scale, -0.40, 0.40),
+        clamp(float(goal_body_xy[1]) * transl_scale, -0.20, 0.20),
+        clamp(0.40 * heading_error, -0.60, 0.60),
+    ], device=dev, dtype=torch.float32)
 
-    deltas = np.array([
-        [0.00, 0.00, 0.00],
-        [+0.05, 0.00, 0.00],
-        [-0.05, 0.00, 0.00],
-        [0.00, +0.05, 0.00],
-        [0.00, -0.05, 0.00],
-        [0.00, 0.00, +0.18],
-        [0.00, 0.00, -0.18],
-        [+0.04, +0.04, 0.00],
-        [+0.04, -0.04, 0.00],
-    ], dtype=np.float32)
+    std = torch.tensor([
+        0.12 if far else 0.09,
+        0.10 if far else 0.07,
+        0.24 if far else 0.18,
+    ], device=dev, dtype=torch.float32)
 
-    best_cost = None
-    best_cmd_np = None
-    best_info: Dict[str, float] = {}
-    best_path = None
+    best = None
 
-    start_frontier_dist = float(np.linalg.norm(frontier_xy - robot_xy))
-    start_wp_dist = float(np.linalg.norm(waypoint_xy - robot_xy))
+    for _ in range(4):
+        cmds = mean + std * torch.randn((cands, 3), device=dev)
+        cmds[:, 0].clamp_(-0.40, 0.40)
+        cmds[:, 1].clamp_(-0.25, 0.25)
+        cmds[:, 2].clamp_(-0.60, 0.60)
 
-    for delta in deltas:
-        cmd_np = base + delta
-        cmd_np[0] = clamp(float(cmd_np[0]), -0.34, 0.34)
-        cmd_np[1] = clamp(float(cmd_np[1]), -0.24, 0.24)
-        cmd_np[2] = clamp(float(cmd_np[2]), -0.65, 0.65)
-        cmd = torch.tensor(cmd_np, device=zc.device, dtype=torch.float32).view(1, 3)
+        z_roll = zc.expand(cands, -1)
+        h_t = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
+        for _t in range(hz):
+            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
 
-        pred_z = predict_cmd_ood(jepa, zc, cmd, horizon=cmd_horizon)
-        pred_raw = float(knn_ood_score(pred_z, safe_bank, k=8).item())
-        pred_rel = normalize_ood(pred_raw, ood_stats)
+        ood_raw = nearest_bank_distance(z_roll, safe_bank)
+        ood_rel = ood_raw - float(safe_stats["p90"])
 
-        path_xy, end_xy, _ = rollout_cmd_kinematic(robot_xy, robot_yaw, cmd_np, rollout_horizon, dt=0.10)
+        costs = []
+        paths = []
+        frontier_vals = []
+        novel_flags = []
+        progress_vals = []
 
-        collision = 0.0
-        clearance_pen = 0.0
-        novel = 0
-        seen = set()
-        for pt in path_xy:
-            clr = min_clearance_to_obstacles(pt, obstacles, inflate=0.14)
-            if clr < 0.0:
-                collision = 1.0
-                clearance_pen += 25.0
-                break
-            if clr < 0.18:
-                clearance_pen += (0.18 - clr) ** 2 * 14.0
-            gx, gy = world_to_grid(pt)
-            key = (gx, gy)
-            if key not in seen:
-                seen.add(key)
-                if (not occ[gy, gx]) and (not visited[gy, gx]):
-                    novel += 1
+        for i in range(cands):
+            cmd_np = cmds[i].detach().cpu().numpy()
+            path_xy, end_xy, end_yaw = rollout_cmd_kinematic(robot_xy, robot_yaw, cmd_np, hz)
+            _ = end_yaw
+            paths.append(path_xy)
 
-        end_frontier_dist = float(np.linalg.norm(frontier_xy - end_xy))
-        end_wp_dist = float(np.linalg.norm(waypoint_xy - end_xy))
-        frontier_progress = start_frontier_dist - end_frontier_dist
-        wp_progress = start_wp_dist - end_wp_dist
-        disp = float(np.linalg.norm(end_xy - robot_xy))
-        stall_pen = max(0.0, 0.05 - disp) * 14.0
-        spin_pen = max(0.0, abs(float(cmd_np[2])) - 0.50) * 1.8
-        reverse_pen = max(0.0, -float(cmd_np[0])) * 1.0
+            end_dist = float(np.linalg.norm(end_xy - frontier_xy))
+            progress = goal_dist - end_dist
+            progress_vals.append(progress)
 
-        cost = (
-            70.0 * collision
-            + 2.2 * clearance_pen
-            + 1.8 * pred_rel
-            + 1.6 * stall_pen
-            + 0.35 * spin_pen
-            + 0.45 * reverse_pen
-            - 1.70 * frontier_progress
-            - 1.30 * wp_progress
-            - 0.55 * float(novel)
-        )
-        if prev_cmd is not None:
-            cost += 0.10 * float(((cmd - prev_cmd) ** 2).sum().item())
+            frontier_gain = local_unknown_gain(sm, end_xy, radius=0.55)
+            frontier_vals.append(frontier_gain)
 
-        if best_cost is None or cost < best_cost:
-            best_cost = cost
-            best_cmd_np = cmd_np.copy()
-            best_path = path_xy.copy()
-            best_info = {
-                "cost": float(cost),
-                "pred_ood_raw": pred_raw,
-                "pred_ood_rel": pred_rel,
-                "clearance": float(clearance_pen),
-                "collision": float(collision),
-                "novel": float(novel),
-                "frontier_progress": float(frontier_progress),
-                "wp_progress": float(wp_progress),
-                "stall": float(stall_pen),
-            }
+            coll_pen = path_collision_penalty(sm, path_xy)
+            smooth_pen = 0.0 if prev_cmd is None else 0.12 * float(torch.sum((cmds[i] - prev_cmd[0]) ** 2).item())
+            reverse_pen = 0.08 if float(cmds[i, 0].item()) < -0.02 else 0.0
 
-    assert best_cmd_np is not None and best_path is not None
-    best_cmd = torch.tensor(best_cmd_np, device=zc.device, dtype=torch.float32).view(1, 3)
-    return best_cmd, best_info, best_path
+            end_g = world_to_grid(sm, end_xy)
+            novel = 0
+            if end_g is not None and sm.free_visits[end_g[0], end_g[1]] == 0:
+                novel = 1
+            novel_flags.append(novel)
 
+            # Lower is better.
+            # OOD weight kept very low: the safe bank is from open floor,
+            # so anything near obstacles will look OOD — don't let it
+            # dominate over actually reaching the frontier.
+            ood_cost = min(0.50, max(0.0, float(ood_rel[i].item())))
+            cost = (
+                coll_pen
+                + 0.05 * ood_cost
+                + smooth_pen
+                + reverse_pen
+                - 2.50 * progress
+                - 0.70 * frontier_gain
+                - 0.25 * float(novel)
+            )
+            costs.append(cost)
 
-# ----------------------------------------------------------------------------
-# HUD helpers
-# ----------------------------------------------------------------------------
+        costs_np = np.asarray(costs, dtype=np.float32)
+        elite_k = max(8, cands // 10)
+        elite_idx = np.argsort(costs_np)[:elite_k]
+        elite_cmds = cmds[torch.as_tensor(elite_idx, device=dev, dtype=torch.long)]
+        mean = elite_cmds.mean(dim=0)
+        std = elite_cmds.std(dim=0) + 1e-4
 
+        i_best = int(np.argmin(costs_np))
+        cur = {
+            "cmd": cmds[i_best].detach().clone().view(1, 3),
+            "path": paths[i_best],
+            "frontier": float(frontier_vals[i_best]),
+            "OODraw": float(ood_raw[i_best].item()),
+            "OODrel": float(ood_rel[i_best].item()),
+            "novel": int(novel_flags[i_best]),
+            "prog": float(progress_vals[i_best]),
+            "cost": float(costs_np[i_best]),
+        }
+        if best is None or cur["cost"] < best["cost"]:
+            best = cur
 
-def draw_bar(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, val: float, vmax: float, label: str, fill=(0, 180, 120)):
-    frac = 0.0 if vmax <= 0 else max(0.0, min(1.0, val / vmax))
-    draw.rectangle([x, y, x + w, y + h], outline=(85, 85, 85), fill=(28, 28, 28))
-    if frac > 0.0:
-        draw.rectangle([x, y, x + int(frac * w), y + h], fill=fill)
-    draw.text((x, y - 16), f"{label}: {val:.2f}", fill=(210, 210, 210))
+    assert best is not None
+    return best["cmd"], best
 
 
-def draw_progress_bar(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, frac: float, label: str, fill=(0, 150, 255)):
-    frac = max(0.0, min(1.0, frac))
-    draw.rectangle([x, y, x + w, y + h], outline=(85, 85, 85), fill=(28, 28, 28))
-    if frac > 0:
-        draw.rectangle([x, y, x + int(frac * w), y + h], fill=fill)
-    draw.text((x, y - 16), label, fill=(210, 210, 210))
+# -----------------------------------------------------------------------------
+# Recovery guard
+# -----------------------------------------------------------------------------
 
+def choose_recovery_cmd(depth_img: Optional[np.ndarray], depth_max: float, dev: torch.device) -> torch.Tensor:
+    d = normalize_depth(depth_img, depth_max)
+    if d is None:
+        return torch.tensor([[-0.20, 0.10, 0.55]], device=dev, dtype=torch.float32)
+
+    h, w = d.shape
+    band = d[int(0.45 * h):int(0.90 * h), :]
+    if band.size == 0:
+        return torch.tensor([[-0.20, 0.10, 0.55]], device=dev, dtype=torch.float32)
+
+    left = float(np.nanmedian(band[:, :max(1, w // 3)]))
+    right = float(np.nanmedian(band[:, 2 * w // 3:]))
+    mid = float(np.nanmedian(band[:, w // 3:2 * w // 3]))
+
+    # Turn hard toward the side with more clearance while backing up.
+    if left > right + 0.10:
+        return torch.tensor([[-0.18, 0.12, 0.55]], device=dev, dtype=torch.float32)
+    if right > left + 0.10:
+        return torch.tensor([[-0.18, -0.12, -0.55]], device=dev, dtype=torch.float32)
+    if mid < 0.60 * depth_max:
+        return torch.tensor([[-0.22, 0.00, 0.60]], device=dev, dtype=torch.float32)
+
+    return torch.tensor([[-0.18, 0.08, 0.45]], device=dev, dtype=torch.float32)
+
+
+# -----------------------------------------------------------------------------
+# HUD / video
+# -----------------------------------------------------------------------------
 
 def world_to_map_px(xy: np.ndarray, map_x0: int, map_y0: int, map_w: int, map_h: int) -> Tuple[int, int]:
     nx = (float(xy[0]) - float(WORLD_MIN[0])) / max(float(WORLD_MAX[0] - WORLD_MIN[0]), 1e-8)
@@ -901,111 +1050,140 @@ def world_to_map_px(xy: np.ndarray, map_x0: int, map_y0: int, map_w: int, map_h:
 
 def draw_minimap(
     draw: ImageDraw.ImageDraw,
+    sm: SensorMap,
     map_x0: int,
     map_y0: int,
     map_w: int,
     map_h: int,
     robot_xy: np.ndarray,
     robot_yaw: float,
+    target_xy: np.ndarray,
     trail: List[np.ndarray],
-    plan_path: Optional[np.ndarray],
-    frontier_xy: Optional[np.ndarray],
-    visited: np.ndarray,
-    occ: np.ndarray,
-    obstacles: Sequence[ObstacleSpec],
+    plan_path: np.ndarray,
 ):
     draw.rectangle([map_x0, map_y0, map_x0 + map_w, map_y0 + map_h], fill=(18, 18, 18), outline=(95, 95, 95))
-    cell_w = map_w / MAP_W
-    cell_h = map_h / MAP_H
-    frontier_mask = compute_frontier_mask(visited, occ)
 
-    for gy in range(MAP_H):
-        for gx in range(MAP_W):
-            x0 = map_x0 + int(gx * cell_w)
-            y0 = map_y0 + int((MAP_H - 1 - gy) * cell_h)
-            x1 = map_x0 + int((gx + 1) * cell_w)
-            y1 = map_y0 + int((MAP_H - gy) * cell_h)
-            if occ[gy, gx]:
-                fill = (80, 48, 28)
-            elif frontier_mask[gy, gx]:
-                fill = (36, 54, 88)
-            elif visited[gy, gx]:
-                fill = (64, 92, 64)
+    for r in range(sm.h):
+        for c in range(sm.w):
+            x0 = map_x0 + int(c / sm.w * map_w)
+            y0 = map_y0 + int(r / sm.h * map_h)
+            x1 = map_x0 + int((c + 1) / sm.w * map_w)
+            y1 = map_y0 + int((r + 1) / sm.h * map_h)
+
+            v = int(sm.grid[r, c])
+            if v == MAP_FREE:
+                fill = (48, 48, 48)
+            elif v == MAP_OCC:
+                fill = (180, 70, 70)
             else:
-                fill = (30, 30, 30)
+                fill = (25, 25, 25)
             draw.rectangle([x0, y0, x1, y1], fill=fill)
 
-    for obs in obstacles:
-        hx = 0.5 * float(obs.size[0])
-        hy = 0.5 * float(obs.size[1])
-        p0 = world_to_map_px(np.array([obs.pos[0] - hx, obs.pos[1] - hy], dtype=np.float32), map_x0, map_y0, map_w, map_h)
-        p1 = world_to_map_px(np.array([obs.pos[0] + hx, obs.pos[1] + hy], dtype=np.float32), map_x0, map_y0, map_w, map_h)
-        left = min(p0[0], p1[0])
-        right = max(p0[0], p1[0])
-        top = min(p0[1], p1[1])
-        bot = max(p0[1], p1[1])
-        draw.rectangle([left, top, right, bot], outline=(220, 180, 120), width=2)
-
     if len(trail) > 1:
-        trail_pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h) for t in trail[-320:]]
-        if len(trail_pts) > 1:
-            draw.line(trail_pts, fill=(255, 214, 10), width=2)
+        pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h) for t in trail[-300:]]
+        draw.line(pts, fill=(255, 220, 80), width=2)
 
     if plan_path is not None and len(plan_path) > 1:
-        plan_pts = [world_to_map_px(pt, map_x0, map_y0, map_w, map_h) for pt in plan_path]
-        draw.line(plan_pts, fill=(0, 170, 255), width=3)
+        pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h) for t in plan_path]
+        draw.line(pts, fill=(0, 170, 255), width=3)
 
-    if frontier_xy is not None:
-        fx, fy = world_to_map_px(frontier_xy, map_x0, map_y0, map_w, map_h)
-        draw.ellipse([fx - 8, fy - 8, fx + 8, fy + 8], fill=(255, 255, 255), outline=(20, 20, 20), width=2)
-        draw.text((fx + 10, fy - 10), "frontier", fill=(240, 240, 240))
+    tx, ty = world_to_map_px(target_xy, map_x0, map_y0, map_w, map_h)
+    draw.ellipse([tx - 6, ty - 6, tx + 6, ty + 6], fill=(255, 255, 255), outline=(10, 10, 10), width=2)
 
     rx, ry = world_to_map_px(robot_xy, map_x0, map_y0, map_w, map_h)
     head = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], dtype=np.float32)
     left = np.array([math.cos(robot_yaw + 2.5), math.sin(robot_yaw + 2.5)], dtype=np.float32)
     right = np.array([math.cos(robot_yaw - 2.5), math.sin(robot_yaw - 2.5)], dtype=np.float32)
-    scale = 12.0
+    scale = 11.0
     tri = [
         (rx + int(head[0] * scale), ry - int(head[1] * scale)),
         (rx + int(left[0] * scale * 0.8), ry - int(left[1] * scale * 0.8)),
         (rx + int(right[0] * scale * 0.8), ry - int(right[1] * scale * 0.8)),
     ]
     draw.polygon(tri, fill=(255, 255, 255), outline=(10, 10, 10))
-    draw.text((map_x0, map_y0 - 16), "Exploration map (green=visited, blue=frontier)", fill=(200, 200, 200))
 
 
-# ----------------------------------------------------------------------------
+def compose_video_frame(
+    over_rgb: np.ndarray,
+    eye_rgb: np.ndarray,
+    sm: SensorMap,
+    robot_xy: np.ndarray,
+    robot_yaw: float,
+    target_xy: np.ndarray,
+    trail: List[np.ndarray],
+    plan_path: np.ndarray,
+    status_text: List[str],
+) -> np.ndarray:
+    pov = Image.fromarray(over_rgb[:, :, :3].astype(np.uint8))
+    eye = Image.fromarray(eye_rgb[:, :, :3].astype(np.uint8))
+    eye = eye.resize((384, 384))
+
+    canvas = Image.new("RGB", (896, 560), (20, 20, 20))
+    canvas.paste(pov, (0, 48))
+    canvas.paste(eye, (512, 96))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0, 0, 895, 47], fill=(12, 12, 12), outline=(70, 70, 70))
+    draw.text((14, 14), "JEPA exploration demo | sensor-frontier navigation", fill=(0, 255, 110))
+
+    draw.text((14, 50), "World / follow view", fill=(190, 190, 190))
+    draw.text((526, 78), "Robot-eye view", fill=(190, 190, 190))
+
+    # Status text below the world-view panel.
+    for i, line in enumerate(status_text):
+        draw.text((14, 510 + 14 * i), line, fill=(200, 200, 200))
+
+    draw_minimap(
+        draw=draw,
+        sm=sm,
+        map_x0=512,
+        map_y0=490 - 120,
+        map_w=340,
+        map_h=120,
+        robot_xy=robot_xy,
+        robot_yaw=robot_yaw,
+        target_xy=target_xy,
+        trail=trail,
+        plan_path=plan_path,
+    )
+    draw.text((512, 344), "Sensor map (dark=unknown, grey=free, red=occupied)", fill=(190, 190, 190))
+
+    return np.asarray(canvas)
+
+
+# -----------------------------------------------------------------------------
 # Main
-# ----------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--jepa_ckpt", required=True)
     parser.add_argument("--ppo_ckpt", required=True)
-    parser.add_argument("--out", type=str, default="jepa_logs/jepa_explore_ood_demo_fast.mp4")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--sim_backend", type=str, default="auto")
     parser.add_argument("--n_steps", type=int, default=1800)
-    parser.add_argument("--coverage_goal", type=float, default=0.55)
-    parser.add_argument("--frontier_reach", type=float, default=0.24)
-    parser.add_argument("--replan_every", type=int, default=3)
-    parser.add_argument("--frontier_stall_steps", type=int, default=20)
-    parser.add_argument("--waypoint_lookahead", type=int, default=6)
-    parser.add_argument("--cmd_horizon", type=int, default=4)
-    parser.add_argument("--rollout_horizon", type=int, default=8)
-    parser.add_argument("--control_repeat", type=int, default=3)
-    parser.add_argument("--ood_bank_samples", type=int, default=128)
-    parser.add_argument("--render_every", type=int, default=1)
+    parser.add_argument("--cands", type=int, default=192)
+    parser.add_argument("--horizon", type=int, default=15)
+    parser.add_argument("--map_res", type=float, default=0.12)
+    parser.add_argument("--depth_max", type=float, default=1.80)
+    parser.add_argument("--coverage_goal", type=float, default=55.0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no_video", action="store_true")
+    parser.add_argument("--out", type=str, default="jepa_logs/explore_demo.mp4")
     parser.add_argument("--debug_first_step", action="store_true")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("⚠️ CUDA requested for torch, but torch.cuda.is_available() is False. Falling back to CPU.")
+        dev = torch.device("cpu")
+    else:
+        dev = torch.device(args.device)
 
-    gs.init(backend=gs.cpu)
+    print(f"🚀 Loading brains into Genesis on {dev.type}...")
+    init_genesis_once(args.sim_backend)
 
     jepa = TinyQuadJEPA().to(dev)
     jepa.load_state_dict(clean_state_dict(torch.load(args.jepa_ckpt, map_location=dev)["model_state_dict"]))
@@ -1015,262 +1193,317 @@ def main():
     ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=dev)["model"], strict=False)
     ppo.eval()
 
-    print("🎬 Harvesting open-floor safe latent bank...")
-    safe_bank = harvest_safe_latent_bank(jepa, ppo, dev, max_latents=args.ood_bank_samples).to(dev)
-    ood_stats = calibrate_ood(safe_bank, k=8)
-    print(f"   Safe bank size: {safe_bank.shape[0]} latents")
-    print(f"   Safe OOD stats: mean={ood_stats.mean:.2f} p90={ood_stats.p90:.2f} p95={ood_stats.p95:.2f} p99={ood_stats.p99:.2f}")
+    print("✅ Both checkpoints loaded successfully!")
 
-    obstacles = make_obstacles()
-    scene, robot, cb, ce, c3, dofs, q0 = init_scene(dev, obstacles=obstacles, start_xy=(0.0, 0.0))
+    # Safe-bank scene: no obstacles.
+    safe_scene, safe_robot, safe_cam_brain, _, _, safe_dofs, safe_q0_np = init_scene(with_obstacles=False)
+    safe_q0 = torch.tensor(safe_q0_np, device=dev, dtype=torch.float32)
+    for _ in range(12):
+        safe_scene.step()
+    move_cams(safe_robot, safe_cam_brain, safe_cam_brain, safe_cam_brain)
+    safe_bank, safe_stats = harvest_safe_bank(
+        safe_scene, safe_robot, safe_cam_brain, safe_q0, safe_dofs, jepa, ppo, dev, n_latents=128
+    )
 
-    occ, clearance = build_obstacle_grid(obstacles, inflate=0.11)
-    visited = np.zeros((MAP_H, MAP_W), dtype=bool)
+    # Exploration scene: actual obstacles.
+    print("🌍 Booting exploration scene...")
+    scene, robot, cam_brain, cam_eye, cam_over, dofs, q0_np = init_scene(with_obstacles=True)
+    q0 = torch.tensor(q0_np, device=dev, dtype=torch.float32)
+
+    for _ in range(20):
+        scene.step()
+
+    prev_action = torch.zeros((1, 12), device=dev)
+    prev_cmd = None
+
+    sm = make_sensor_map(args.map_res)
+    trail: List[np.ndarray] = []
+    recent_pos: Deque[np.ndarray] = deque(maxlen=18)
+    recent_cov: Deque[float] = deque(maxlen=40)
 
     writer = None
     if not args.no_video:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         writer = imageio.get_writer(args.out, fps=30)
 
-    pa = torch.zeros((1, 12), device=dev)
-    planner = PlannerState()
-    trail: List[np.ndarray] = []
-    coverage_history: List[float] = []
-    ood_history: List[float] = []
+    frontier_xy = np.array([0.5, 0.0], dtype=np.float32)
+    frontier_switches = 0
+    frontier_blacklist: List[np.ndarray] = []
 
-    free_cells = int((~occ).sum())
-    print(f"\n🐕 Running fast exploration demo ({args.n_steps} steps)", flush=True)
-    print(f"   Free cells: {free_cells} | Coverage goal: {args.coverage_goal:.0%}", flush=True)
-    print("   Entering control loop...", flush=True)
+    # How long (steps) we've been targeting the current frontier without
+    # meaningful coverage gain — used to detect unreachable frontiers.
+    frontier_age = 0
+    cov_at_frontier_start = 0.0
+    FRONTIER_PATIENCE = 60  # steps before we blacklist a stale frontier
 
-    prev_xy = None
-    current_info: Dict[str, float] = {"cost": 0.0, "pred_ood_raw": 0.0, "pred_ood_rel": 0.0, "clearance": 0.0, "collision": 0.0, "novel": 0.0, "frontier_progress": 0.0, "wp_progress": 0.0, "stall": 0.0}
+    guard_mode = "none"
+    guard_steps = 0
+    guard_cmd = torch.zeros((1, 3), device=dev)
+    stuck_count = 0  # consecutive stuck episodes
+
+    # Wander mode: random walk when persistently stuck.
+    wander_steps = 0
+    wander_cmd = torch.zeros((1, 3), device=dev)
+
+    # Lightweight metric accumulators for the summary JSON.
+    metric_cov_history: List[float] = []
+    metric_guard_counts: Dict[str, int] = {"recover": 0, "wander": 0}
+    metric_step_times: List[float] = []
+
+    print(f"\n🐕 Running fast exploration demo ({args.n_steps} steps)")
+    print(f"   Free cells: {sm.grid.size} | Coverage goal: {args.coverage_goal:.0f}%")
+    print("   Entering control loop...")
 
     for step in range(args.n_steps):
-        step_t0 = time.perf_counter()
-        if step == 0 and args.debug_first_step:
-            print("   [debug] step 0: move_cams", flush=True)
-        cep, cel, ceu, c3p, c3l, c3u = move_cams(robot, cb, ce, c3)
-        rp = robot.get_pos().cpu().numpy()
-        rq = robot.get_quat().cpu().numpy()
-        if rp.ndim > 1:
-            rp = rp[0]
-        if rq.ndim > 1:
-            rq = rq[0]
-        robot_xy = rp[:2].copy()
-        trail.append(robot_xy.copy())
-        if prev_xy is None:
-            mark_visited(visited, robot_xy, radius_cells=1)
-        else:
-            mark_visited_segment(visited, prev_xy, robot_xy, radius_cells=1)
-        prev_xy = robot_xy.copy()
+        t0 = time.time()
 
-        coverage = float((visited & (~occ)).sum()) / max(float(free_cells), 1.0)
-        coverage_history.append(coverage)
-        if coverage >= args.coverage_goal:
-            print(f"\n🎉 Coverage goal reached at step {step}: {coverage:.1%}")
-            break
+        if args.debug_first_step and step == 0:
+            print("   [debug] step 0: move_cams")
+        robot_pos_3d, robot_yaw, _, _ = move_cams(robot, cam_brain, cam_eye, cam_over)
+        robot_xy = robot_pos_3d[:2].astype(np.float32)
 
-        yaw = math.atan2(
-            2.0 * (float(rq[0]) * float(rq[3]) + float(rq[1]) * float(rq[2])),
-            1.0 - 2.0 * (float(rq[2]) ** 2 + float(rq[3]) ** 2),
+        if args.debug_first_step and step == 0:
+            print("   [debug] step 0: get_jepa_state")
+        vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
+        zc = jepa.encoder(vis, prop).detach()
+
+        update_sensor_map_from_depth(
+            sm=sm,
+            robot_xy=robot_xy,
+            robot_yaw=robot_yaw,
+            depth_img=depth,
+            fov_deg=58.0,
+            depth_max=args.depth_max,
+            footprint_radius=0.20,
         )
 
-        if step == 0 and args.debug_first_step:
-            print("   [debug] step 0: get_jepa_state", flush=True)
-        v, p = get_jepa_state(robot, cb, q0, pa, dofs, dev)
-        with torch.no_grad():
-            zc = jepa.encoder(v, p).detach()
-            current_ood_raw = float(knn_ood_score(zc, safe_bank, k=8).item())
-            current_ood_rel = float(normalize_ood(current_ood_raw, ood_stats))
-        ood_history.append(current_ood_raw)
+        cov = coverage_percent(sm)
+        trail.append(robot_xy.copy())
+        recent_pos.append(robot_xy.copy())
+        recent_cov.append(cov)
 
-        robot_cell = world_to_grid(robot_xy)
-        needs_new_frontier = False
-        if planner.frontier is None:
-            needs_new_frontier = True
-        elif float(np.linalg.norm(planner.frontier.xy - robot_xy)) < args.frontier_reach:
-            needs_new_frontier = True
-        elif planner.stall_count >= args.frontier_stall_steps:
-            needs_new_frontier = True
+        # --- Frontier staleness tracking ---
+        frontier_age += 1
+        cov_gain = cov - cov_at_frontier_start
 
-        if step == 0 and args.debug_first_step:
-            print("   [debug] step 0: frontier selection", flush=True)
-        if needs_new_frontier:
-            planner.frontier = choose_frontier_target(visited, occ, robot_xy)
-            planner.path_cells = None
-            planner.waypoint_xy = None
-            planner.cmd = None
-            planner.best_path_xy = None
-            planner.hold_steps = 0
-            planner.stall_count = 0
-            planner.frontier_switches += 1
-            if planner.frontier is None:
-                print("\n✅ No frontier remaining; map fully explored.")
-                break
+        # If we've been targeting the same frontier for too long with
+        # negligible coverage gain, blacklist it and force a switch.
+        force_new_frontier = False
+        if frontier_age >= FRONTIER_PATIENCE and cov_gain < 0.5:
+            frontier_blacklist.append(frontier_xy.copy())
+            force_new_frontier = True
+            frontier_age = 0
+            cov_at_frontier_start = cov
 
-        if planner.frontier is None:
-            break
+        if args.debug_first_step and step == 0:
+            print("   [debug] step 0: frontier selection")
 
-        if step == 0 and args.debug_first_step:
-            print("   [debug] step 0: path planning / local cmd", flush=True)
-        if (
-            planner.path_cells is None
-            or planner.hold_steps <= 0
-            or step % max(args.replan_every, 1) == 0
-        ):
-            path_cells = astar_path(robot_cell, planner.frontier.cell, occ, clearance)
-            if path_cells is None or len(path_cells) == 0:
-                planner.frontier = None
-                continue
-            planner.path_cells = path_cells
-            planner.waypoint_xy = choose_waypoint_from_path(path_cells, robot_xy, args.waypoint_lookahead)
-            planner.cmd, current_info, planner.best_path_xy = choose_local_cmd(
-                jepa=jepa,
-                safe_bank=safe_bank,
-                ood_stats=ood_stats,
-                zc=zc,
-                robot_xy=robot_xy.copy(),
-                robot_yaw=yaw,
-                waypoint_xy=planner.waypoint_xy.copy(),
-                frontier_xy=planner.frontier.xy.copy(),
-                current_ood_rel=current_ood_rel,
-                visited=visited,
-                occ=occ,
-                obstacles=obstacles,
-                prev_cmd=planner.cmd,
-                cmd_horizon=args.cmd_horizon,
-                rollout_horizon=args.rollout_horizon,
-            )
-            planner.hold_steps = args.replan_every
+        frontier_xy_new, frontier_score = select_frontier_target(
+            sm, robot_xy, blacklist=frontier_blacklist
+        )
+        dist_to_new = float(np.linalg.norm(frontier_xy_new - frontier_xy))
+        if dist_to_new > 0.18 or force_new_frontier:
+            frontier_switches += 1
+            frontier_xy = frontier_xy_new
+            frontier_age = 0
+            cov_at_frontier_start = cov
 
-        assert planner.cmd is not None
-        cmd = planner.cmd.clone()
-        planner.hold_steps -= 1
+        if args.debug_first_step and step == 0:
+            print("   [debug] step 0: path planning / local cmd")
 
-        disp_proxy = float(np.linalg.norm(planner.best_path_xy[-1] - planner.best_path_xy[0])) if planner.best_path_xy is not None and len(planner.best_path_xy) > 1 else 0.0
-        if disp_proxy < 0.05:
-            planner.stall_count += 1
+        cmd, plan_stats = plan_local_cmd(
+            jepa=jepa,
+            zc=zc,
+            safe_bank=safe_bank,
+            safe_stats=safe_stats,
+            sm=sm,
+            robot_xy=robot_xy,
+            robot_yaw=robot_yaw,
+            frontier_xy=frontier_xy,
+            prev_cmd=prev_cmd,
+            cands=args.cands,
+            hz=args.horizon,
+            dev=dev,
+        )
+
+        # --- Stuck detection ---
+        disp_recent = 0.0
+        if len(recent_pos) >= recent_pos.maxlen:
+            disp_recent = float(np.linalg.norm(recent_pos[-1] - recent_pos[0]))
+
+        # Coverage stall: if coverage hasn't moved in the recent window,
+        # we're stuck even if the robot is drifting slightly.
+        cov_stall = False
+        if len(recent_cov) >= recent_cov.maxlen:
+            cov_stall = (max(recent_cov) - min(recent_cov)) < 0.3
+
+        is_stuck = (
+            guard_steps <= 0
+            and wander_steps <= 0
+            and len(recent_pos) >= recent_pos.maxlen
+            and (disp_recent < 0.12 or cov_stall)
+        )
+
+        if is_stuck:
+            stuck_count += 1
+            # Blacklist the current frontier — it's clearly unreachable.
+            frontier_blacklist.append(frontier_xy.copy())
+
+            if stuck_count >= 3:
+                # Persistent stuck: enter wander mode — pick a random
+                # direction and commit to it for a while.
+                wander_angle = robot_yaw + np.random.uniform(-math.pi, math.pi)
+                wander_cmd = torch.tensor([[
+                    0.30 * math.cos(wander_angle - robot_yaw),
+                    0.30 * math.sin(wander_angle - robot_yaw),
+                    float(np.clip(wrap_to_pi(wander_angle - robot_yaw) * 0.5, -0.6, 0.6)),
+                ]], device=dev, dtype=torch.float32)
+                wander_steps = 30
+                guard_mode = "wander"
+                stuck_count = 0
+            else:
+                # Normal recovery: back up + turn hard.
+                guard_mode = "stuck_recover"
+                guard_steps = 14
+                guard_cmd = choose_recovery_cmd(depth, args.depth_max, dev)
+
+        # Apply guard / wander overrides.
+        if wander_steps > 0:
+            cmd = wander_cmd
+            guard_mode = "wander"
+            wander_steps -= 1
+            if wander_steps <= 0:
+                guard_mode = "none"
+                # Force frontier re-selection after wander.
+                frontier_age = FRONTIER_PATIENCE + 1
+                cov_at_frontier_start = cov - 10.0
+        elif guard_steps > 0:
+            cmd = guard_cmd
+            guard_mode = "recover_hold"
+            guard_steps -= 1
+            if guard_steps <= 0:
+                guard_mode = "none"
+                stuck_count = max(0, stuck_count - 1)
+                # Force frontier re-selection after recovery.
+                frontier_blacklist.append(frontier_xy.copy())
         else:
-            planner.stall_count = max(planner.stall_count - 1, 0)
+            guard_mode = "none"
 
-        if step == 0 and args.debug_first_step:
-            print("   [debug] step 0: PPO + physics", flush=True)
-        with torch.no_grad():
-            pa = ppo.act_deterministic(get_sys1_obs(robot, q0, pa, cmd, dofs, dev)).detach()
-        target = to_genesis_target(q0 + 0.3 * pa[0])
-        robot.control_dofs_position(target, dofs)
-        for _ in range(max(args.control_repeat, 1)):
-            scene.step()
+        prev_cmd = cmd.detach().clone()
 
-        frontier_dist = float(np.linalg.norm(planner.frontier.xy - robot_xy)) if planner.frontier is not None else 0.0
-        if (not args.no_video) and (step % max(args.render_every, 1) == 0):
-            if step == 0 and args.debug_first_step:
-                print("   [debug] step 0: rendering / video", flush=True)
-            frame3 = c3.render()[0]
-            if hasattr(frame3, "cpu"):
-                frame3 = frame3.cpu().numpy()
-            p3 = Image.fromarray(frame3[:, :, :3].astype(np.uint8))
+        if args.debug_first_step and step == 0:
+            print("   [debug] step 0: PPO + physics")
+        prev_action = scene_step_with_policy(
+            scene=scene,
+            robot=robot,
+            q0=q0,
+            prev_action=prev_action,
+            cmd=cmd,
+            dofs=dofs,
+            ppo=ppo,
+            dev=dev,
+            control_scale=0.30,
+            sim_substeps=4,
+        )
 
-            frame_e = ce.render()[0]
-            if hasattr(frame_e, "cpu"):
-                frame_e = frame_e.cpu().numpy()
-            pe = Image.fromarray(frame_e[:, :, :3].astype(np.uint8))
+        ood_raw = float(plan_stats["OODraw"])
+        ood_rel = float(plan_stats["OODrel"])
+        novel = int(plan_stats["novel"])
+        prog = float(plan_stats["prog"])
+        cost = float(plan_stats["cost"])
 
-            d3 = ImageDraw.Draw(p3)
-            if planner.best_path_xy is not None:
-                path_px = [
-                    project_world_to_pixel(np.array([pt[0], pt[1], 0.05], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
-                    for pt in planner.best_path_xy
-                ]
-                valid_px = [px for px in path_px if px is not None]
-                if len(valid_px) > 1:
-                    d3.line(valid_px, fill=(0, 150, 255), width=4)
+        dt = time.time() - t0
 
-            for obs in obstacles:
-                px = project_world_to_pixel(obs.pos, c3p, c3l, c3u, 50, 512, 512)
-                if px is not None:
-                    d3.text((px[0] + 6, px[1] - 6), obs.name, fill=(255, 220, 150))
+        # Accumulate metrics.
+        metric_step_times.append(dt)
+        metric_cov_history.append(cov)
+        if guard_mode == "stuck_recover":
+            metric_guard_counts["recover"] += 1
+        elif guard_mode == "wander":
+            metric_guard_counts["wander"] += 1
 
-            if planner.frontier is not None:
-                fx = project_world_to_pixel(np.array([planner.frontier.xy[0], planner.frontier.xy[1], 0.08], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
-                if fx is not None:
-                    d3.ellipse([fx[0] - 12, fx[1] - 12, fx[0] + 12, fx[1] + 12], outline=(255, 255, 255), width=3)
-                    d3.text((fx[0] + 16, fx[1] - 6), "frontier", fill=(255, 255, 255))
-
-            header_h = 192
-            canv = Image.new("RGB", (896, header_h + 512), (20, 20, 20))
-            canv.paste(p3, (0, header_h))
-            canv.paste(pe, (512, header_h))
-
-            drw = ImageDraw.Draw(canv)
-            drw.rectangle([0, 0, 895, header_h - 1], fill=(10, 10, 10), outline=(55, 55, 55))
-            drw.line([(0, header_h - 1), (895, header_h - 1)], fill=(90, 90, 90), width=2)
-            drw.rectangle([0, header_h, 511, header_h + 511], outline=(70, 70, 70), width=2)
-            drw.rectangle([512, header_h, 895, header_h + 383], outline=(70, 70, 70), width=2)
-            drw.text((12, header_h - 22), "World view + local rollout", fill=(190, 190, 190))
-            drw.text((524, header_h - 22), "Agent / close-up view", fill=(190, 190, 190))
-
-            drw.text((20, 16), "JEPA | Fast Frontier Exploration + OOD Safety", fill=(0, 255, 100))
-            drw.text((20, 36), f"Step: {step:04d} | Coverage: {coverage:.1%} | Frontier switches: {planner.frontier_switches}", fill=(200, 200, 200))
-            drw.text((20, 56), f"Frontier dist: {frontier_dist:.2f} m | OOD raw: {current_ood_raw:.2f} | OOD rel: {current_ood_rel:.2f}", fill=(200, 200, 200))
-            drw.text((20, 76), f"Cmd: vx={float(cmd[0, 0].item()):+.2f} vy={float(cmd[0, 1].item()):+.2f} wz={float(cmd[0, 2].item()):+.2f}", fill=(200, 200, 200))
-            drw.text((20, 96), f"Plan cost: {current_info['cost']:.2f} | Novel(best): {int(current_info['novel'])} | Frontier prog: {current_info['frontier_progress']:+.2f}", fill=(200, 200, 200))
-            drw.text((20, 116), f"Pred OOD raw: {current_info['pred_ood_raw']:.2f} | Pred OOD rel: {current_info['pred_ood_rel']:.2f} | Stall: {current_info['stall']:.2f}", fill=(200, 200, 200))
-
-            draw_bar(drw, 20, 150, 165, 12, current_ood_rel, 3.0, "OOD rel", fill=(220, 90, 40))
-            draw_bar(drw, 220, 150, 165, 12, current_info["pred_ood_rel"], 3.0, "pred OOD rel", fill=(180, 80, 180))
-            draw_progress_bar(drw, 420, 150, 160, 12, coverage, "Coverage", fill=(0, 170, 255))
-            draw_progress_bar(drw, 610, 150, 160, 12, clamp(current_info["novel"] / 8.0, 0.0, 1.0), "Novel cells in local rollout", fill=(100, 210, 120))
-
-            if len(ood_history) > 2:
-                hist = np.asarray(ood_history[-90:], dtype=np.float32)
-                hmin = float(hist.min())
-                hmax = max(float(hist.max()), hmin + 0.1)
-                pts = []
-                for i, val in enumerate(hist):
-                    x_px = 20 + int(i / max(len(hist) - 1, 1) * 420)
-                    y_px = 182 - int((float(val) - hmin) / (hmax - hmin) * 34)
-                    pts.append((x_px, y_px))
-                if len(pts) > 1:
-                    drw.line(pts, fill=(255, 180, 90), width=2)
-                drw.text((20, 128), "Raw OOD history", fill=(180, 180, 180))
-
-            draw_minimap(
-                drw,
-                map_x0=540,
-                map_y0=22,
-                map_w=322,
-                map_h=138,
-                robot_xy=robot_xy,
-                robot_yaw=yaw,
-                trail=trail,
-                plan_path=planner.best_path_xy,
-                frontier_xy=planner.frontier.xy if planner.frontier is not None else None,
-                visited=visited,
-                occ=occ,
-                obstacles=obstacles,
-            )
-            drw.text((540, 164), "Blue = local rollout | Yellow = actual trail | White = active frontier", fill=(120, 120, 120))
-            writer.append_data(np.array(canv))
-        step_dt = time.perf_counter() - step_t0
         print(
-            f"\r⚡ step={step:04d} | cov={coverage:.1%} | frontier={frontier_dist:.2f} | "
-            f"OODraw={current_ood_raw:.2f} | OODrel={current_ood_rel:.2f} | novel={int(current_info['novel'])} | "
-            f"prog={current_info['frontier_progress']:+.2f} | cost={current_info['cost']:.2f} | dt={step_dt:.2f}s",
+            f"\r⚡ step={step+1:04d} | cov={cov:4.1f}% | frontier={frontier_score:4.2f} | "
+            f"prog={prog:+.2f} | cost={cost:.2f} | dt={dt:.2f}s | "
+            f"guard={guard_mode} | bl={len(frontier_blacklist)}",
             end="",
             flush=True,
         )
 
+        if writer is not None:
+            over_rgb, _ = render_rgb_depth(cam_over)
+            eye_rgb, _ = render_rgb_depth(cam_eye)
+            status = [
+                f"coverage={cov:.1f}%  free={free_cell_count(sm)}  occ={occ_cell_count(sm)}  blacklisted={len(frontier_blacklist)}",
+                f"prog={prog:+.2f}  cost={cost:.2f}  guard={guard_mode}",
+                f"cmd=[{float(cmd[0,0]):+.2f}, {float(cmd[0,1]):+.2f}, {float(cmd[0,2]):+.2f}]",
+            ]
+            frame = compose_video_frame(
+                over_rgb=over_rgb,
+                eye_rgb=eye_rgb,
+                sm=sm,
+                robot_xy=robot_xy,
+                robot_yaw=robot_yaw,
+                target_xy=frontier_xy,
+                trail=trail,
+                plan_path=plan_stats["path"],
+                status_text=status,
+            )
+            writer.append_data(frame)
+
+        if cov >= args.coverage_goal:
+            break
+
     if writer is not None:
         writer.close()
-    final_cov = float((visited & (~occ)).sum()) / max(float(free_cells), 1.0)
-    if writer is not None:
-        print(f"\n\n✅ Exploration demo saved to {args.out}")
+
+    # --- Write summary JSON ---------------------------------------------------
+    final_cov = coverage_percent(sm)
+    steps_taken = min(step + 1, args.n_steps)
+    mean_dt = float(np.mean(metric_step_times)) if metric_step_times else 0.0
+
+    # Find when coverage milestones were first reached.
+    milestones = {}
+    for pct in [10, 20, 30, 40, 50]:
+        for i, c in enumerate(metric_cov_history):
+            if c >= pct:
+                milestones[f"step_at_{pct}pct"] = i
+                break
+
+    summary = {
+        "jepa_ckpt": args.jepa_ckpt,
+        "ppo_ckpt": args.ppo_ckpt,
+        "steps_budget": args.n_steps,
+        "steps_taken": steps_taken,
+        "coverage_goal": args.coverage_goal,
+        "final_coverage_pct": round(final_cov, 2),
+        "goal_reached": final_cov >= args.coverage_goal,
+        "free_cells": free_cell_count(sm),
+        "occupied_cells": occ_cell_count(sm),
+        "frontier_switches": frontier_switches,
+        "frontier_blacklisted": len(frontier_blacklist),
+        "recovery_episodes": metric_guard_counts["recover"],
+        "wander_episodes": metric_guard_counts["wander"],
+        "mean_step_time_s": round(mean_dt, 3),
+        "fps": round(1.0 / mean_dt, 1) if mean_dt > 0 else 0.0,
+        "coverage_milestones": milestones,
+        "video_path": args.out if not args.no_video else None,
+    }
+
+    summary_path = os.path.join(
+        os.path.dirname(args.out) or ".", "explore_summary.json"
+    )
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n")
+    if args.no_video:
+        print("✅ Exploration demo completed (no video written)")
     else:
-        print(f"\n\n✅ Exploration demo completed (no video written)")
-    print(f"   Final coverage: {final_cov:.1%}")
-    print(f"   Frontier switches: {planner.frontier_switches}")
+        print(f"✅ Exploration demo saved to {args.out}")
+    print(f"   Final coverage: {final_cov:.1f}%")
+    print(f"   Frontier switches: {frontier_switches}")
+    print(f"   Summary: {summary_path}")
 
 
 if __name__ == "__main__":

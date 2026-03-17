@@ -1,119 +1,41 @@
 #!/usr/bin/env python3
-"""
-Open-floor JEPA navigation demo (drop-in style replacement)
+from __future__ import annotations
 
-Purpose:
-- remove obstacle-avoidance confounds
-- show that the current JEPA-style model can drive the robot toward
-  reachable latent goals in open space
-- produce a cleaner demo with forward / strafe / turn primitives
-
-Usage:
-    python JEPA/6_genesis_eval.py \
-        --jepa_ckpt jepa_checkpoints/jepa_epoch_8_step_3000.pt \
-        --ppo_ckpt runs/pupper_omni_20260225_150134/ckpt_20000.pt \
-        --device cpu
 """
-import os
-import json
-import time
-import math
+JEPA landmark-navigation eval (expanded demo)
+
+What this version adds on top of the stable regenerated eval:
+- Route mode with repeated landmark visits (default: W1 -> W2 -> W3 -> W2 -> W1)
+- Larger default step budget
+- Optional kidnap/relocalization event to demonstrate replanning robustness
+- Minimap HUD with robot trail, waypoint route, active target, and planner rollout
+- Route-progress overlays and visit counters for a more showable demo video
+
+The navigation core stays the same:
+- approach-aligned latent breadcrumbs
+- commands clamped to rollout training distribution
+- energy + geometric progress planning cost
+- PPO low-level controller for actuation
+"""
+
 import argparse
-from typing import List, Tuple
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import imageio
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image, ImageDraw
-
 import genesis as gs
 
 
-# -----------------------------------------
-# Quaternion helpers
-# -----------------------------------------
-def quat_conj_wxyz(q: torch.Tensor) -> torch.Tensor:
-    return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
+# ----------------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------------
 
-
-def quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
-    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
-    w = aw * bw - ax * bx - ay * by - az * bz
-    x = aw * bx + ax * bw + ay * bz - az * by
-    y = aw * by - ax * bz + ay * bw + az * bx
-    z = aw * bz + ax * by - ay * bx + az * bw
-    return torch.stack([w, x, y, z], dim=-1)
-
-
-def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    zeros = torch.zeros((v.shape[0], 1), device=v.device, dtype=v.dtype)
-    vq = torch.cat([zeros, v], dim=-1)
-    return quat_mul_wxyz(quat_mul_wxyz(q, vq), quat_conj_wxyz(q))[:, 1:4]
-
-
-def world_to_body_vec(quat_wxyz: torch.Tensor, vec_world: torch.Tensor) -> torch.Tensor:
-    return quat_rotate_wxyz(quat_conj_wxyz(quat_wxyz), vec_world)
-
-
-def quat_to_yaw_wxyz_np(q: np.ndarray) -> float:
-    w, x, y, z = q
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return float(np.arctan2(siny_cosp, cosy_cosp))
-
-
-def angle_wrap(a: float) -> float:
-    return (a + np.pi) % (2.0 * np.pi) - np.pi
-
-
-# -----------------------------------------
-# Projection helper for HUD goal marker
-# -----------------------------------------
-def project_3d_to_2d(pt_3d, cam_pos, look_at, fov_deg=50, res=(768, 768)):
-    forward = look_at - cam_pos
-    dist = np.linalg.norm(forward)
-    if dist < 1e-5:
-        return None
-    forward = forward / dist
-
-    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    if abs(np.dot(forward, world_up)) > 0.999:
-        world_up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-
-    right = np.cross(forward, world_up)
-    rnorm = np.linalg.norm(right)
-    if rnorm < 1e-6:
-        return None
-    right = right / rnorm
-
-    up = np.cross(right, forward)
-    up = up / max(np.linalg.norm(up), 1e-6)
-
-    v = pt_3d - cam_pos
-    z_cam = np.dot(v, forward)
-    if z_cam <= 0.01:
-        return None
-
-    x_cam = np.dot(v, right)
-    y_cam = np.dot(v, up)
-
-    fov_rad = np.radians(fov_deg)
-    f = 1.0 / np.tan(fov_rad / 2.0)
-
-    x_ndc = (x_cam * f) / z_cam
-    y_ndc = (y_cam * f) / z_cam
-
-    u = (x_ndc + 1.0) * 0.5 * res[0]
-    v = (1.0 - y_ndc) * 0.5 * res[1]
-    return int(u), int(v)
-
-
-# -----------------------------------------
-# Architectures
-# -----------------------------------------
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int = 50, act_dim: int = 12, hid: int = 256):
         super().__init__()
@@ -129,7 +51,7 @@ class ActorCritic(nn.Module):
         )
         self.log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
 
-    def act_deterministic(self, obs: torch.Tensor):
+    def act_deterministic(self, obs: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.actor(obs))
 
 
@@ -137,10 +59,10 @@ class VisionEncoder(nn.Module):
     def __init__(self, feature_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1), nn.ELU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), nn.ELU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), nn.ELU(),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1), nn.ELU(),
+            nn.Conv2d(3, 32, 4, 2, 1), nn.ELU(),
+            nn.Conv2d(32, 64, 4, 2, 1), nn.ELU(),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.ELU(),
+            nn.Conv2d(128, 256, 4, 2, 1), nn.ELU(),
             nn.Flatten(),
             nn.Linear(256 * 4 * 4, feature_dim),
             nn.LayerNorm(feature_dim),
@@ -155,7 +77,8 @@ class ProprioEncoder(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256), nn.ELU(),
-            nn.Linear(256, feature_dim), nn.LayerNorm(feature_dim),
+            nn.Linear(256, feature_dim),
+            nn.LayerNorm(feature_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -165,636 +88,832 @@ class ProprioEncoder(nn.Module):
 class JointEncoder(nn.Module):
     def __init__(self, latent_dim: int = 256):
         super().__init__()
-        self.vis_enc = VisionEncoder(feature_dim=128)
-        self.prop_enc = ProprioEncoder(input_dim=47, feature_dim=128)
+        self.vis_enc = VisionEncoder(128)
+        self.prop_enc = ProprioEncoder(47, 128)
         self.fusion = nn.Sequential(
             nn.Linear(256, 256), nn.ELU(),
             nn.Linear(256, latent_dim),
         )
 
     def forward(self, vision: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-        v_feat = self.vis_enc(vision)
-        p_feat = self.prop_enc(proprio)
-        return self.fusion(torch.cat([v_feat, p_feat], dim=-1))
+        return self.fusion(torch.cat([self.vis_enc(vision), self.prop_enc(proprio)], dim=-1))
 
 
 class LatentPredictor(nn.Module):
     def __init__(self, latent_dim: int = 256, cmd_dim: int = 3):
         super().__init__()
         self.input_proj = nn.Sequential(nn.Linear(latent_dim + cmd_dim, latent_dim), nn.ELU())
-        self.rnn = nn.GRUCell(input_size=latent_dim, hidden_size=latent_dim)
+        self.rnn = nn.GRUCell(latent_dim, latent_dim)
         self.output_proj = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.ELU(),
             nn.Linear(latent_dim, latent_dim),
         )
 
-    def forward(self, z_t: torch.Tensor, c_t: torch.Tensor, h_t: torch.Tensor):
+    def forward(self, z_t: torch.Tensor, c_t: torch.Tensor, h_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.input_proj(torch.cat([z_t, c_t], dim=-1))
         h_next = self.rnn(x, h_t)
         return self.output_proj(h_next), h_next
 
 
-class EBM_TinyQuadJEPA(nn.Module):
+class TinyQuadJEPA(nn.Module):
     def __init__(self, latent_dim: int = 256):
         super().__init__()
-        self.encoder = JointEncoder(latent_dim=latent_dim)
-        self.predictor = LatentPredictor(latent_dim=latent_dim, cmd_dim=3)
+        self.latent_dim = latent_dim
+        self.encoder = JointEncoder(latent_dim)
+        self.predictor = LatentPredictor(latent_dim, 3)
 
 
-# -----------------------------------------
-# Scene setup (open floor)
-# -----------------------------------------
-def init_genesis_scene(device):
-    print("🌍 Booting Genesis Simulator (Open-Floor Demo Mode)...")
+class GoalEnergyHead(nn.Module):
+    def __init__(self, latent_dim: int = 256, hidden_dim: int = 1024, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim * 4, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.LayerNorm(hidden_dim // 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, z_pred: torch.Tensor, z_goal: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z_pred, z_goal, z_pred - z_goal, z_pred * z_goal], dim=-1)).squeeze(-1)
+
+
+# ----------------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WaypointSpec:
+    pos: np.ndarray
+    approach_dir_xy: np.ndarray
+    name: str
+    color_rgb: Tuple[float, float, float]
+    panel_pos: Tuple[float, float, float]
+    panel_size: Tuple[float, float, float]
+
+
+def clean_state_dict(d: dict) -> dict:
+    return {k.replace("_orig_mod.", ""): v for k, v in d.items()}
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def wrap_to_pi(x: float) -> float:
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def yaw_to_quat(yaw_rad: float) -> np.ndarray:
+    half = 0.5 * yaw_rad
+    return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float32)
+
+
+def body_to_world_xy(yaw: float, v_body_xy: np.ndarray) -> np.ndarray:
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    vx_b, vy_b = float(v_body_xy[0]), float(v_body_xy[1])
+    return np.array([c * vx_b - s * vy_b, s * vx_b + c * vy_b], dtype=np.float32)
+
+
+def world_to_body_xy(yaw: float, v_world_xy: np.ndarray) -> np.ndarray:
+    return body_to_world_xy(-yaw, v_world_xy)
+
+
+def create_checkerboard(path: str = "dense_checker.png") -> str:
+    res, grid = 1024, 16
+    img = np.zeros((res, res, 3), dtype=np.uint8)
+    for i in range(res):
+        for j in range(res):
+            c = 255 if ((i // grid) + (j // grid)) % 2 == 0 else 40
+            img[i, j] = [c, c, c]
+    Image.fromarray(img).save(path)
+    return os.path.abspath(path)
+
+
+def make_waypoints() -> List[WaypointSpec]:
+    return [
+        WaypointSpec(
+            pos=np.array([2.0, 0.0, 0.15], dtype=np.float32),
+            approach_dir_xy=np.array([1.0, 0.0], dtype=np.float32),
+            name="RED beacon",
+            color_rgb=(0.94, 0.16, 0.16),
+            panel_pos=(3.5, 0.0, 0.60),
+            panel_size=(0.05, 2.00, 1.20),
+        ),
+        WaypointSpec(
+            pos=np.array([2.0, 2.0, 0.15], dtype=np.float32),
+            approach_dir_xy=np.array([0.0, 1.0], dtype=np.float32),
+            name="GREEN beacon",
+            color_rgb=(0.16, 0.86, 0.16),
+            panel_pos=(2.0, 3.5, 0.60),
+            panel_size=(2.00, 0.05, 1.20),
+        ),
+        WaypointSpec(
+            pos=np.array([0.0, 2.0, 0.15], dtype=np.float32),
+            approach_dir_xy=np.array([-1.0, 0.0], dtype=np.float32),
+            name="BLUE beacon",
+            color_rgb=(0.16, 0.31, 0.94),
+            panel_pos=(-1.5, 2.0, 0.60),
+            panel_size=(0.05, 2.00, 1.20),
+        ),
+    ]
+
+
+def parse_route(route_str: str, n_waypoints: int) -> List[int]:
+    toks = [t.strip() for t in route_str.split(",") if t.strip()]
+    if not toks:
+        raise ValueError("Route must contain at least one waypoint index")
+    route = []
+    for t in toks:
+        idx = int(t) - 1
+        if idx < 0 or idx >= n_waypoints:
+            raise ValueError(f"Route index {t} out of range 1..{n_waypoints}")
+        route.append(idx)
+    return route
+
+
+def to_genesis_target(x: torch.Tensor) -> torch.Tensor:
+    x_np = x.detach().to("cpu").numpy().astype(np.float32, copy=True)
+    return torch.tensor(x_np, device=gs.device, dtype=torch.float32)
+
+
+# ----------------------------------------------------------------------------
+# Genesis scene + observations
+# ----------------------------------------------------------------------------
+
+
+def init_scene(device: torch.device, waypoints: List[WaypointSpec]):
     gs.init(backend=gs.cpu)
     scene = gs.Scene(show_viewer=False)
 
-    tex_path = os.path.abspath("checkerboard.png")
-    if not os.path.exists(tex_path):
-        checker = np.indices((32, 32)).sum(axis=0) % 2
-        checker = np.repeat(np.repeat(checker, 32, axis=0), 32, axis=1)
-        checker = (checker * 255).astype(np.uint8)
-        Image.fromarray(checker).save(tex_path)
-
+    tex = create_checkerboard()
     scene.add_entity(
-        morph=gs.morphs.Plane(),
-        surface=gs.surfaces.Rough(
-            diffuse_texture=gs.textures.ImageTexture(image_path=tex_path)
-        ),
+        gs.morphs.Plane(),
+        surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ImageTexture(image_path=tex)),
     )
 
     robot = scene.add_entity(
-        gs.morphs.URDF(
-            file="assets/mini_pupper/mini_pupper.urdf",
-            pos=(0.0, 0.0, 0.12),
-            fixed=False,
-            merge_fixed_links=False,
-            requires_jac_and_IK=False,
-        )
+        gs.morphs.URDF(file="assets/mini_pupper/mini_pupper.urdf", pos=(0.0, 0.0, 0.12), fixed=False)
     )
 
-    cam_brain = scene.add_camera(res=(64, 64), pos=(0.0, 0.0, 0.0), lookat=(1.0, 0.0, 0.0), fov=50)
-    cam_ego_vis = scene.add_camera(res=(768, 768), pos=(0.0, 0.0, 0.0), lookat=(1.0, 0.0, 0.0), fov=50)
-    cam_3rd = scene.add_camera(res=(768, 768), pos=(0.0, 0.0, 0.0), lookat=(1.0, 0.0, 0.0), fov=50)
+    for wp in waypoints:
+        scene.add_entity(
+            gs.morphs.Box(pos=wp.panel_pos, size=wp.panel_size, fixed=True),
+            surface=gs.surfaces.Rough(color=wp.color_rgb),
+        )
 
+    cb = scene.add_camera(res=(64, 64), fov=50)
+    ce = scene.add_camera(res=(384, 384), fov=50)
+    c3 = scene.add_camera(res=(512, 512), fov=50)
     scene.build()
 
-    actuated_joints = [
+    joint_names = [
         "lf_hip_joint", "lh_hip_joint", "rf_hip_joint", "rh_hip_joint",
         "lf_thigh_joint", "lh_thigh_joint", "rf_thigh_joint", "rh_thigh_joint",
         "lf_calf_joint", "lh_calf_joint", "rf_calf_joint", "rh_calf_joint",
     ]
-    dofs_idx = [robot.get_joint(name).dofs_idx_local[0] for name in actuated_joints]
+    dofs = [robot.get_joint(n).dofs_idx_local[0] for n in joint_names]
 
-    q0 = np.array([
+    q0_np = np.array([
         0.06, 0.06, -0.06, -0.06,
         0.85, 0.85, 0.85, 0.85,
         -1.75, -1.75, -1.75, -1.75,
     ], dtype=np.float32)
-    robot.set_dofs_position(q0, dofs_idx)
-    robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs_idx)
-    robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs_idx)
+    q0 = torch.tensor(q0_np, device=device)
 
-    return scene, robot, cam_brain, cam_ego_vis, cam_3rd, dofs_idx, torch.tensor(q0, device=device)
+    robot.set_pos(np.array([0.0, 0.0, 0.12], dtype=np.float32))
+    robot.set_quat(yaw_to_quat(0.0))
+    robot.set_dofs_position(q0_np, dofs)
+    robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs)
+    robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs)
 
-
-# -----------------------------------------
-# State builders
-# -----------------------------------------
-def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
-    pos = robot.get_pos().to(device)
-    if pos.dim() == 1:
-        pos = pos.unsqueeze(0)
-    quat = robot.get_quat().to(device)
-    if quat.dim() == 1:
-        quat = quat.unsqueeze(0)
-    vel_w = robot.get_vel().to(device)
-    if vel_w.dim() == 1:
-        vel_w = vel_w.unsqueeze(0)
-    ang_w = robot.get_ang().to(device)
-    if ang_w.dim() == 1:
-        ang_w = ang_w.unsqueeze(0)
-
-    vel_b = world_to_body_vec(quat, vel_w)
-    ang_b = world_to_body_vec(quat, ang_w)
-
-    q = robot.get_dofs_position(act_dofs).to(device)
-    if q.dim() == 1:
-        q = q.unsqueeze(0)
-    dq = robot.get_dofs_velocity(act_dofs).to(device)
-    if dq.dim() == 1:
-        dq = dq.unsqueeze(0)
-
-    z = pos[:, 2:3]
-    q_rel = q - q0.unsqueeze(0)
-    return torch.cat([z, quat, vel_b, ang_b, q_rel, dq, prev_action, cmd], dim=1)
+    return scene, robot, cb, ce, c3, dofs, q0
 
 
-def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
-    render_out = cam_brain.render()
-    img = render_out[0] if isinstance(render_out, tuple) else render_out
-    if hasattr(img, 'cpu'):
+def get_sys1_obs(r, q0: torch.Tensor, p_a: torch.Tensor, cmd: torch.Tensor, dofs, dev: torch.device) -> torch.Tensor:
+    p = r.get_pos().to(dev)
+    q = r.get_quat().to(dev)
+    v = r.get_vel().to(dev)
+    a = r.get_ang().to(dev)
+    p, q, v, a = [x.unsqueeze(0) if x.dim() == 1 else x for x in (p, q, v, a)]
+
+    q_c = torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=-1)
+
+    def qm(qa: torch.Tensor, qb: torch.Tensor) -> torch.Tensor:
+        return torch.stack([
+            qa[:, 0] * qb[:, 0] - qa[:, 1] * qb[:, 1] - qa[:, 2] * qb[:, 2] - qa[:, 3] * qb[:, 3],
+            qa[:, 0] * qb[:, 1] + qa[:, 1] * qb[:, 0] + qa[:, 2] * qb[:, 3] - qa[:, 3] * qb[:, 2],
+            qa[:, 0] * qb[:, 2] - qa[:, 1] * qb[:, 3] + qa[:, 2] * qb[:, 0] + qa[:, 3] * qb[:, 1],
+            qa[:, 0] * qb[:, 3] + qa[:, 1] * qb[:, 2] - qa[:, 2] * qb[:, 1] + qa[:, 3] * qb[:, 0],
+        ], dim=-1)
+
+    def world_to_body(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        return qm(qm(q_c, torch.cat([torch.zeros((vec.shape[0], 1), device=vec.device), vec], dim=-1)), quat)[:, 1:4]
+
+    qd = r.get_dofs_position(dofs).to(dev).unsqueeze(0)
+    dq = r.get_dofs_velocity(dofs).to(dev).unsqueeze(0)
+    return torch.cat([p[:, 2:3], q, world_to_body(q, v), world_to_body(q, a), qd - q0.unsqueeze(0), dq, p_a, cmd], dim=1)
+
+
+@torch.no_grad()
+def get_jepa_state(r, cb, q0: torch.Tensor, pa: torch.Tensor, dofs, dev: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    img = cb.render()[0]
+    if hasattr(img, "cpu"):
         img = img.cpu().numpy()
-    if img.shape[-1] == 4:
-        img = img[:, :, :3]
-    img_chw = np.transpose(img.astype(np.uint8), (2, 0, 1))
-    vis_tensor = torch.from_numpy(img_chw).float().to(device) / 255.0
-
-    dummy_cmd = torch.zeros((1, 3), device=device)
-    sys1_obs = get_system1_obs(robot, q0, prev_action, dummy_cmd, act_dofs, device)
-    return vis_tensor.unsqueeze(0), sys1_obs[:, :47].clone()
+    rgb = np.transpose(img[:, :, :3], (2, 0, 1)).copy()
+    vision = torch.from_numpy(rgb).float().to(dev) / 255.0
+    proprio = get_sys1_obs(r, q0, pa, torch.zeros((1, 3), device=dev), dofs, dev)[:, :47]
+    return vision.unsqueeze(0), proprio
 
 
-# -----------------------------------------
-# Cameras and HUD
-# -----------------------------------------
-def move_cameras(robot, cam_brain, cam_ego_vis, cam_3rd=None, goal_pos=None):
-    r_pos = robot.get_pos().cpu().numpy()
-    r_quat = robot.get_quat().cpu().numpy()
-    if r_pos.ndim > 1:
-        r_pos, r_quat = r_pos[0], r_quat[0]
-
-    w, x, y, z = r_quat
-    fx = 1 - 2 * (y**2 + z**2)
-    fy = 2 * (x * y + w * z)
-    fz = 2 * (x * z - w * y)
-    forward = np.array([fx, fy, fz], dtype=np.float32)
-
-    ux = 2 * (x * z + w * y)
-    uy = 2 * (y * z - w * x)
-    uz = 1 - 2 * (x**2 + y**2)
-    up = np.array([ux, uy, uz], dtype=np.float32)
-
-    cam_pos = r_pos + (forward * 0.10) + (up * 0.05)
-    look_target = cam_pos + (forward * 1.0)
-
-    for cam in [cam_brain, cam_ego_vis]:
-        try:
-            cam.set_pose(pos=cam_pos, lookat=look_target, up=up)
-        except TypeError:
-            cam.set_pose(pos=cam_pos, lookat=look_target)
-
-    cam_3rd_pos, look_at_pt = None, None
-    if cam_3rd is not None:
-        cam_3rd_pos = r_pos + np.array([-1.3, 0.0, 0.9], dtype=np.float32)
-        if goal_pos is not None:
-            look_at_pt = 0.55 * r_pos + 0.45 * goal_pos
-        else:
-            look_at_pt = r_pos + forward * 0.5
-        try:
-            cam_3rd.set_pose(pos=cam_3rd_pos, lookat=look_at_pt)
-        except TypeError:
-            cam_3rd.set_pose(pos=cam_3rd_pos, lookat=look_at_pt)
-
-    return cam_3rd_pos, look_at_pt
+def move_cams(r, cb, ce, c3):
+    p = r.get_pos().cpu().numpy()
+    q = r.get_quat().cpu().numpy()
+    if p.ndim > 1:
+        p, q = p[0], q[0]
+    fw = np.array([
+        1 - 2 * (q[2] ** 2 + q[3] ** 2),
+        2 * (q[1] * q[2] + q[0] * q[3]),
+        2 * (q[1] * q[3] - q[0] * q[2]),
+    ])
+    up = np.array([
+        2 * (q[1] * q[3] + q[0] * q[2]),
+        2 * (q[2] * q[3] - q[0] * q[1]),
+        1 - 2 * (q[1] ** 2 + q[2] ** 2),
+    ])
+    cp = p + fw * 0.10 + up * 0.05
+    lk = cp + fw * 1.0
+    for c in (cb, ce):
+        c.set_pose(pos=cp, lookat=lk, up=up)
+    c3p = p - fw * 1.8 + np.array([0.0, 0.0, 0.8])
+    c3l = p + fw * 0.5
+    c3.set_pose(pos=c3p, lookat=c3l, up=np.array([0.0, 0.0, 1.0]))
+    return cp, lk, up, c3p, c3l, np.array([0.0, 0.0, 1.0])
 
 
-def render_camera_rgb(cam) -> np.ndarray:
-    out = cam.render()
-    img = out[0] if isinstance(out, tuple) else out
-    if hasattr(img, 'cpu'):
-        img = img.cpu().numpy()
-    if img.shape[-1] == 4:
-        img = img[:, :, :3]
-    return img.astype(np.uint8)
+def project_world_to_pixel(wp: np.ndarray, cp: np.ndarray, cl: np.ndarray, cu: np.ndarray, fov: float, w: int, h: int):
+    dist = np.linalg.norm(cl - cp)
+    f = (cl - cp) / max(dist, 1e-8)
+    s = np.cross(f, cu / np.linalg.norm(cu))
+    sn = np.linalg.norm(s)
+    if sn < 1e-5:
+        return None
+    s /= sn
+    u = np.cross(s, f)
+    view = np.eye(4)
+    view[0, :3], view[1, :3], view[2, :3] = s, u, -f
+    view[0, 3], view[1, 3], view[2, 3] = -np.dot(s, cp), -np.dot(u, cp), np.dot(f, cp)
+    asp = w / h
+    fy = 1.0 / np.tan(np.radians(fov) / 2.0)
+    proj = np.zeros((4, 4))
+    proj[0, 0], proj[1, 1], proj[2, 2], proj[2, 3], proj[3, 2] = fy / asp, fy, -1.0, -0.02, -1.0
+    pt = np.array([wp[0], wp[1], wp[2], 1.0], dtype=np.float32)
+    clip = proj @ view @ pt
+    if clip[3] <= 0:
+        return None
+    ndc = clip[:3] / clip[3]
+    return int((ndc[0] + 1.0) * 0.5 * w), int((1.0 - ndc[1]) * 0.5 * h)
 
 
-def draw_goal_marker(img_3rd_pil: Image.Image, cam_3rd_pos, look_at_pt, goal_pos_np):
-    if cam_3rd_pos is None or look_at_pt is None:
-        return
-    uv = project_3d_to_2d(goal_pos_np, cam_3rd_pos, look_at_pt, fov_deg=50, res=(768, 768))
-    if uv is None:
-        return
-    u, v = uv
-    r = 15
-    draw = ImageDraw.Draw(img_3rd_pil)
-    draw.ellipse((u-r, v-r, u+r, v+r), outline="red", width=4)
-    draw.line((u, v-r-20, u, v+r+20), fill="red", width=4)
-    draw.line((u-r-20, v, u+r+20, v), fill="red", width=4)
+# ----------------------------------------------------------------------------
+# Planning / breadcrumb harvesting
+# ----------------------------------------------------------------------------
 
 
-def compose_frame(img_ego, img_3rd, hud_lines: List[str]) -> np.ndarray:
-    combined = Image.new('RGB', (1536, 768))
-    combined.paste(Image.fromarray(img_ego), (0, 0))
-    combined.paste(Image.fromarray(img_3rd), (768, 0))
-    draw = ImageDraw.Draw(combined)
-    draw.rectangle([(8, 8), (520, 190)], fill=(0, 0, 0))
-    draw.text((16, 14), "Left: ego view used by JEPA", fill=(255, 255, 255))
-    draw.text((784, 14), "Right: external open-floor tracking view", fill=(255, 255, 255))
-
-    y = 40
-    for line in hud_lines:
-        draw.text((16, y), line, fill=(255, 255, 255))
-        y += 18
-    return np.array(combined)
+def rollout_cmd_kinematic(start_xy: np.ndarray, start_yaw: float, cmd_xyw: np.ndarray, hz: int, dt: float = 0.10):
+    pos = np.array(start_xy, dtype=np.float32).copy()
+    yaw = float(start_yaw)
+    path = []
+    for _ in range(hz):
+        path.append(pos.copy())
+        world_v = body_to_world_xy(yaw, cmd_xyw[:2])
+        pos += dt * world_v
+        yaw = wrap_to_pi(yaw + dt * float(cmd_xyw[2]))
+    return np.stack(path, axis=0), pos, yaw
 
 
-# -----------------------------------------
-# Open-floor primitive demonstration path
-# -----------------------------------------
-def primitive_script():
-    return [
-        ("forward",  24, [0.28,  0.00,  0.00]),
-        ("left",     16, [0.00,  0.16,  0.00]),
-        ("right",    16, [0.00, -0.16,  0.00]),
-        ("turn_l",   18, [0.00,  0.00,  0.55]),
-        ("forward2", 18, [0.24,  0.00,  0.00]),
-        ("turn_r",   18, [0.00,  0.00, -0.55]),
-        ("diag",     18, [0.18,  0.10,  0.10]),
-    ]
+@torch.no_grad()
+def plan_best_cmd(
+    jepa: TinyQuadJEPA,
+    head: GoalEnergyHead,
+    zc: torch.Tensor,
+    zg: torch.Tensor,
+    robot_xy: np.ndarray,
+    robot_yaw: float,
+    goal_xy: np.ndarray,
+    goal_body_xy: np.ndarray,
+    dist_to_goal: float,
+    heading_error: float,
+    cands: int,
+    hz: int,
+    dev: torch.device,
+    prev: torch.Tensor | None = None,
+):
+    far = dist_to_goal > 0.9
+    transl_scale = 0.30 if far else 0.18
+    if abs(heading_error) > 0.9:
+        transl_scale *= 0.45
+
+    mean = torch.tensor([
+        clamp(float(goal_body_xy[0]) * transl_scale, -0.35, 0.35),
+        clamp(float(goal_body_xy[1]) * transl_scale, -0.20, 0.20),
+        clamp(0.40 * heading_error, -0.45, 0.45),
+    ], device=dev, dtype=torch.float32)
+
+    std = torch.tensor([
+        0.12 if far else 0.09,
+        0.10 if far else 0.08,
+        0.22 if far else 0.18,
+    ], device=dev, dtype=torch.float32)
+
+    best_cmd = mean.view(1, 3)
+    best_path = None
+    best_cost = None
+    best_energy = None
+
+    for _ in range(5):
+        cmds = mean + std * torch.randn((cands, 3), device=dev)
+        cmds[:, 0].clamp_(-0.40, 0.40)
+        cmds[:, 1].clamp_(-0.25, 0.25)
+        cmds[:, 2].clamp_(-0.60, 0.60)
+
+        z_roll = zc.expand(cands, -1)
+        h_t = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
+        for _t in range(hz):
+            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
+        eng = head(z_roll, zg.expand_as(z_roll))
+
+        geo_cost = torch.empty((cands,), device=dev, dtype=torch.float32)
+        path_cache = []
+        for i in range(cands):
+            cmd_np = cmds[i].detach().cpu().numpy()
+            path_xy, end_xy, end_yaw = rollout_cmd_kinematic(robot_xy, robot_yaw, cmd_np, hz)
+            path_cache.append(path_xy)
+            end_dist = float(np.linalg.norm(end_xy - goal_xy))
+            end_goal_angle = math.atan2(float(goal_xy[1] - end_xy[1]), float(goal_xy[0] - end_xy[0]))
+            end_heading_err = abs(wrap_to_pi(end_goal_angle - end_yaw))
+            geo_cost[i] = 0.85 * end_dist + 0.10 * end_heading_err
+
+        cost = eng + geo_cost
+        if prev is not None:
+            cost = cost + 0.10 * (cmds - prev).pow(2).sum(dim=-1)
+
+        k = max(cands // 10, 8)
+        elite_idx = torch.topk(cost, k=k, largest=False).indices
+        elite_cmds = cmds[elite_idx]
+        mean = elite_cmds.mean(dim=0)
+        std = elite_cmds.std(dim=0) + 1e-4
+
+        iter_best = int(torch.argmin(cost).item())
+        iter_best_cost = float(cost[iter_best].item())
+        if best_cost is None or iter_best_cost < best_cost:
+            best_cost = iter_best_cost
+            best_cmd = cmds[iter_best].view(1, 3).detach().clone()
+            best_energy = float(eng[iter_best].item())
+            best_path = path_cache[iter_best]
+
+    assert best_path is not None and best_energy is not None and best_cost is not None
+    return best_cmd, {"eng": best_energy, "path": best_path, "cost": best_cost}
 
 
-def capture_demo_waypoints(scene, robot, cam_brain, cam_ego_vis, act_dofs, q0, ppo, jepa, device,
-                           action_scale: float, waypoint_stride: int, min_waypoint_spacing: float):
-    print("\n🎬 Driving primitive open-floor demo to generate reachable latent waypoints...")
+@torch.no_grad()
+def harvest_breadcrumb(
+    robot,
+    cb,
+    q0: torch.Tensor,
+    jepa: TinyQuadJEPA,
+    ppo: ActorCritic,
+    dofs,
+    dev: torch.device,
+    scene,
+    wp: WaypointSpec,
+    n_avg: int = 5,
+    warmup: int = 10,
+    speed: float = 0.25,
+    start_offset: float = 0.45,
+):
+    approach = wp.approach_dir_xy.astype(np.float32)
+    approach = approach / max(float(np.linalg.norm(approach)), 1e-8)
+    start_xy = wp.pos[:2] - start_offset * approach
+    start_yaw = math.atan2(float(approach[1]), float(approach[0]))
 
-    waypoints_z: List[np.ndarray] = []
-    waypoints_pos: List[np.ndarray] = []
-    waypoints_yaw: List[float] = []
-    prev_action_demo = torch.zeros((1, 12), device=device)
-    demo_step_count = 0
-    last_keep_xy = None
-    total_demo_steps = sum(d for _, d, _ in primitive_script())
-
-    for phase_name, duration, cmd_vals in primitive_script():
-        demo_cmd = torch.tensor([cmd_vals], device=device, dtype=torch.float32)
-        for _ in range(duration):
-            sys1_obs = get_system1_obs(robot, q0, prev_action_demo, demo_cmd, act_dofs, device)
-            with torch.no_grad():
-                action = ppo.act_deterministic(sys1_obs)
-            prev_action_demo = action.clone()
-
-            q_tgt = q0.unsqueeze(0) + action_scale * action
-            robot.control_dofs_position(q_tgt[0].detach().to(gs.device), act_dofs)
-
-            for _ in range(4):
-                scene.step()
-            move_cameras(robot, cam_brain, cam_ego_vis)
-
-            demo_step_count += 1
-            print(f"\rDriving primitive path... {demo_step_count}/{total_demo_steps} [{phase_name}]", end="")
-
-            if demo_step_count % waypoint_stride == 0:
-                pos_w = robot.get_pos().cpu().numpy()
-                quat_w = robot.get_quat().cpu().numpy()
-                if pos_w.ndim > 1:
-                    pos_w = pos_w[0]
-                    quat_w = quat_w[0]
-                keep = False
-                if last_keep_xy is None:
-                    keep = True
-                else:
-                    keep = np.linalg.norm(pos_w[:2] - last_keep_xy) >= min_waypoint_spacing
-                if keep:
-                    vis_w, prop_w = get_jepa_state(robot, cam_brain, q0, prev_action_demo, act_dofs, device)
-                    with torch.no_grad():
-                        z_w = jepa.encoder(vis_w, prop_w).detach().cpu().numpy()[0]
-                    pos_keep = pos_w.copy()
-                    pos_keep[2] = 0.10
-                    waypoints_z.append(z_w)
-                    waypoints_pos.append(pos_keep)
-                    waypoints_yaw.append(quat_to_yaw_wxyz_np(quat_w))
-                    last_keep_xy = pos_keep[:2].copy()
-
-    print(f"\n✅ Captured {len(waypoints_z)} spaced open-floor waypoints.")
-    return np.stack(waypoints_z), np.stack(waypoints_pos), np.asarray(waypoints_yaw, dtype=np.float32)
-
-
-def save_waypoints(path: str, z: np.ndarray, pos: np.ndarray, yaw: np.ndarray):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    np.savez_compressed(path, waypoints_z=z, waypoints_pos=pos, waypoints_yaw=yaw)
-    print(f"💾 Saved waypoint file to {path}")
-
-
-def load_waypoints(path: str):
-    data = np.load(path)
-    if "waypoints_yaw" in data:
-        return data["waypoints_z"], data["waypoints_pos"], data["waypoints_yaw"]
-    # backward-compatible fallback
-    n = len(data["waypoints_pos"])
-    return data["waypoints_z"], data["waypoints_pos"], np.zeros((n,), dtype=np.float32)
-
-
-# -----------------------------------------
-# Planner
-# -----------------------------------------
-def build_candidate_bank(prev_best_cmd: torch.Tensor, n: int, device: torch.device):
-    templates = torch.tensor([
-        [0.00, 0.00, 0.00],
-        [0.20, 0.00, 0.00],
-        [0.30, 0.00, 0.00],
-        [0.00, 0.16, 0.00],
-        [0.00, -0.16, 0.00],
-        [0.10, 0.08, 0.00],
-        [0.10, -0.08, 0.00],
-        [0.00, 0.00, 0.35],
-        [0.00, 0.00, -0.35],
-        [0.00, 0.00, 0.55],
-        [0.00, 0.00, -0.55],
-        [0.18, 0.10, 0.10],
-        [0.18, -0.10, -0.10],
-    ], device=device, dtype=torch.float32)
-
-    if prev_best_cmd is not None:
-        prev = prev_best_cmd.detach().clone().view(1, 3)
-        template_extra = torch.cat([
-            prev,
-            prev + torch.tensor([[0.06, 0.00, 0.00]], device=device),
-            prev + torch.tensor([[-0.06, 0.00, 0.00]], device=device),
-            prev + torch.tensor([[0.00, 0.05, 0.00]], device=device),
-            prev + torch.tensor([[0.00, -0.05, 0.00]], device=device),
-            prev + torch.tensor([[0.00, 0.00, 0.12]], device=device),
-            prev + torch.tensor([[0.00, 0.00, -0.12]], device=device),
-        ], dim=0)
-        templates = torch.cat([templates, template_extra], dim=0)
-
-    remaining = max(0, n - templates.shape[0])
-    rand = (torch.rand((remaining, 3), device=device) * 2.0) - 1.0
-    rand[:, 0] *= 0.40
-    rand[:, 1] *= 0.22
-    rand[:, 2] *= 0.60
-
-    if prev_best_cmd is not None and remaining > 0:
-        half = remaining // 2
-        noise = torch.randn((half, 3), device=device) * torch.tensor([0.08, 0.05, 0.15], device=device)
-        local = prev_best_cmd.view(1, 3) + noise
-        local[:, 0] = local[:, 0].clamp(-0.40, 0.40)
-        local[:, 1] = local[:, 1].clamp(-0.22, 0.22)
-        local[:, 2] = local[:, 2].clamp(-0.60, 0.60)
-        rand[:half] = local
-
-    cmds = torch.cat([templates, rand], dim=0)
-    cmds[:, 0] = cmds[:, 0].clamp(-0.40, 0.40)
-    cmds[:, 1] = cmds[:, 1].clamp(-0.22, 0.22)
-    cmds[:, 2] = cmds[:, 2].clamp(-0.60, 0.60)
-    return cmds[:n]
-
-
-def plan_best_cmd(jepa, z_current, z_goal, h_exec, prev_best_cmd, candidates: int, horizon: int, device):
-    candidate_cmds = build_candidate_bank(prev_best_cmd, candidates, device)
-    z_batch = z_current.expand(candidate_cmds.shape[0], -1)
-    h_batch = h_exec.expand(candidate_cmds.shape[0], -1).clone()
-
-    z_pred = z_batch
-    cmd_seq = candidate_cmds.unsqueeze(1).expand(-1, horizon, -1)
-
-    with torch.no_grad():
-        for t in range(horizon):
-            z_pred, h_batch = jepa.predictor(z_pred, cmd_seq[:, t], h_batch)
-
-        latent_cost = 1.0 - F.cosine_similarity(z_pred, z_goal.expand_as(z_pred), dim=-1)
-        reg_turn = 0.05 * candidate_cmds[:, 2].abs()
-        reg_side = 0.03 * candidate_cmds[:, 1].abs()
-        reg_stop = 0.02 * F.relu(0.04 - candidate_cmds[:, 0])
-        smooth = torch.zeros_like(latent_cost)
-        if prev_best_cmd is not None:
-            smooth = 0.05 * (candidate_cmds - prev_best_cmd.view(1, 3)).pow(2).sum(dim=-1)
-        total_cost = latent_cost + reg_turn + reg_side + reg_stop + smooth
-
-        best_idx = torch.argmin(total_cost)
-        best_cmd = candidate_cmds[best_idx].view(1, 3)
-        stats = {
-            "best_total_cost": float(total_cost[best_idx].item()),
-            "best_latent_cost": float(latent_cost[best_idx].item()),
-            "candidate_cost_min": float(total_cost.min().item()),
-            "candidate_cost_mean": float(total_cost.mean().item()),
-            "candidate_cost_max": float(total_cost.max().item()),
-        }
-    return best_cmd, stats
-
-
-# -----------------------------------------
-# Main
-# -----------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--jepa_ckpt", type=str, required=True)
-    parser.add_argument("--ppo_ckpt", type=str, required=True)
-    parser.add_argument("--candidates", type=int, default=300)
-    parser.add_argument("--horizon", type=int, default=15)
-    parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--plan_freq", type=int, default=5)
-    parser.add_argument("--out", type=str, default="eval_output_open_nav.mp4")
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--waypoints_file", type=str, default="")
-    parser.add_argument("--save_waypoints", type=str, default="jepa_logs/open_nav_waypoints.npz")
-    parser.add_argument("--waypoint_stride", type=int, default=5)
-    parser.add_argument("--min_waypoint_spacing", type=float, default=0.10)
-    parser.add_argument("--reach_tol", type=float, default=0.11)
-    parser.add_argument("--yaw_tol", type=float, default=0.45)
-    parser.add_argument("--summary_json", type=str, default="jepa_logs/eval_open_nav_summary.json")
-    args = parser.parse_args()
-
-    device = torch.device(args.device)
-    print(f"🚀 Loading brains into Genesis on {device}...")
-
-    jepa = EBM_TinyQuadJEPA().to(device)
-    jepa_ckpt = torch.load(args.jepa_ckpt, map_location=device, weights_only=True)
-    jepa.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in jepa_ckpt['model_state_dict'].items()})
-    jepa.eval()
-
-    ppo = ActorCritic(obs_dim=50, act_dim=12).to(device)
-    ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=device)["model"])
-    ppo.eval()
-    print("✅ Both checkpoints loaded successfully!")
-
-    scene, robot, cam_brain, cam_ego_vis, cam_3rd, act_dofs, q0 = init_genesis_scene(device)
-    q0_np = q0.cpu().numpy()
-    action_scale = 0.30
-
-    for _ in range(10):
+    robot.set_pos(np.array([start_xy[0], start_xy[1], 0.12], dtype=np.float32))
+    robot.set_quat(yaw_to_quat(start_yaw))
+    robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
+    for _ in range(8):
         scene.step()
 
-    if args.waypoints_file and os.path.exists(args.waypoints_file):
-        print(f"📦 Loading waypoint file from {args.waypoints_file}")
-        waypoints_z_np, waypoints_pos_np, waypoints_yaw_np = load_waypoints(args.waypoints_file)
-    else:
-        waypoints_z_np, waypoints_pos_np, waypoints_yaw_np = capture_demo_waypoints(
-            scene, robot, cam_brain, cam_ego_vis, act_dofs, q0, ppo, jepa, device,
-            action_scale=action_scale,
-            waypoint_stride=args.waypoint_stride,
-            min_waypoint_spacing=args.min_waypoint_spacing,
-        )
-        if args.save_waypoints:
-            save_waypoints(args.save_waypoints, waypoints_z_np, waypoints_pos_np, waypoints_yaw_np)
+    pa_h = torch.zeros((1, 12), device=dev)
+    cmd = torch.tensor([[speed, 0.0, 0.0]], device=dev)
 
-    waypoints_z = torch.from_numpy(waypoints_z_np).float().to(device)
+    for _ in range(warmup):
+        obs = get_sys1_obs(robot, q0, pa_h, cmd, dofs, dev)
+        pa_h = ppo.act_deterministic(obs)
+        target = to_genesis_target(q0 + 0.3 * pa_h[0])
+        robot.control_dofs_position(target, dofs)
+        for _k in range(4):
+            scene.step()
 
-    print("⏪ Resetting to origin to begin open-floor latent tracking test...")
-    start_pos = np.array([0.0, 0.0, 0.12], dtype=np.float32)
-    try:
-        robot.set_pos(start_pos)
-        robot.set_dofs_position(q0_np, act_dofs)
-    except Exception:
-        pass
+    latents = []
+    for _ in range(n_avg):
+        obs = get_sys1_obs(robot, q0, pa_h, cmd, dofs, dev)
+        pa_h = ppo.act_deterministic(obs)
+        target = to_genesis_target(q0 + 0.3 * pa_h[0])
+        robot.control_dofs_position(target, dofs)
+        for _k in range(4):
+            scene.step()
+        v, p = get_jepa_state(robot, cb, q0, pa_h, dofs, dev)
+        latents.append(jepa.encoder(v, p).detach())
+
+    return torch.stack(latents, dim=0).mean(dim=0)
+
+
+# ----------------------------------------------------------------------------
+# HUD helpers
+# ----------------------------------------------------------------------------
+
+
+def draw_energy_bar(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, energy: float, label: str, color=(0, 200, 100)):
+    draw.rectangle([x, y, x + w, y + h], outline=(80, 80, 80), fill=(30, 30, 30))
+    frac = max(0.0, min(1.0, energy / 4.0))
+    bar_w = int(w * frac)
+    if bar_w > 0:
+        draw.rectangle([x, y, x + bar_w, y + h], fill=color)
+    draw.text((x + w + 4, y), f"{label}: {energy:.2f}", fill=(200, 200, 200))
+
+
+def draw_progress_bar(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, frac: float, label: str, color=(0, 160, 255)):
+    frac = max(0.0, min(1.0, frac))
+    draw.rectangle([x, y, x + w, y + h], outline=(90, 90, 90), fill=(30, 30, 30))
+    if frac > 0:
+        draw.rectangle([x, y, x + int(w * frac), y + h], fill=color)
+    draw.text((x, y - 16), label, fill=(200, 200, 200))
+
+
+def world_to_map_px(xy: np.ndarray, map_x0: int, map_y0: int, map_w: int, map_h: int,
+                    world_min: np.ndarray, world_max: np.ndarray) -> Tuple[int, int]:
+    nx = (float(xy[0]) - float(world_min[0])) / max(float(world_max[0] - world_min[0]), 1e-8)
+    ny = (float(xy[1]) - float(world_min[1])) / max(float(world_max[1] - world_min[1]), 1e-8)
+    px = map_x0 + int(np.clip(nx, 0.0, 1.0) * map_w)
+    py = map_y0 + map_h - int(np.clip(ny, 0.0, 1.0) * map_h)
+    return px, py
+
+
+def draw_minimap(
+    draw: ImageDraw.ImageDraw,
+    map_x0: int,
+    map_y0: int,
+    map_w: int,
+    map_h: int,
+    waypoints: List[WaypointSpec],
+    route: List[int],
+    route_ptr: int,
+    robot_xy: np.ndarray,
+    robot_yaw: float,
+    trail: List[np.ndarray],
+    plan_path: np.ndarray,
+    visit_counts: Dict[int, int],
+):
+    world_min = np.array([-2.2, -1.2], dtype=np.float32)
+    world_max = np.array([3.8, 3.8], dtype=np.float32)
+
+    draw.rectangle([map_x0, map_y0, map_x0 + map_w, map_y0 + map_h], fill=(18, 18, 18), outline=(95, 95, 95))
+
+    # Floor grid
+    for gx in np.linspace(world_min[0], world_max[0], 7):
+        p0 = world_to_map_px(np.array([gx, world_min[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        p1 = world_to_map_px(np.array([gx, world_max[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        draw.line([p0, p1], fill=(35, 35, 35), width=1)
+    for gy in np.linspace(world_min[1], world_max[1], 6):
+        p0 = world_to_map_px(np.array([world_min[0], gy], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        p1 = world_to_map_px(np.array([world_max[0], gy], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        draw.line([p0, p1], fill=(35, 35, 35), width=1)
+
+    route_colors = [(255, 80, 80), (80, 255, 80), (80, 140, 255)]
+
+    # Route polyline
+    if len(route) > 1:
+        pts = [world_to_map_px(waypoints[idx].pos[:2], map_x0, map_y0, map_w, map_h, world_min, world_max) for idx in route]
+        draw.line(pts, fill=(120, 120, 120), width=2)
+
+    # Trail
+    if len(trail) > 1:
+        trail_pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h, world_min, world_max) for t in trail[-240:]]
+        if len(trail_pts) > 1:
+            draw.line(trail_pts, fill=(255, 214, 10), width=2)
+
+    # Planned rollout
+    if plan_path is not None and len(plan_path) > 1:
+        plan_pts = [world_to_map_px(pt, map_x0, map_y0, map_w, map_h, world_min, world_max) for pt in plan_path]
+        draw.line(plan_pts, fill=(0, 170, 255), width=3)
+
+    # Waypoints and visit counts
+    for wi, wp in enumerate(waypoints):
+        px, py = world_to_map_px(wp.pos[:2], map_x0, map_y0, map_w, map_h, world_min, world_max)
+        col = route_colors[wi]
+        r = 8 if wi == route[route_ptr] else 6
+        draw.ellipse([px - r, py - r, px + r, py + r], fill=col, outline=(230, 230, 230), width=1)
+        draw.text((px + 10, py - 8), f"W{wi + 1} x{visit_counts.get(wi, 0)}", fill=col)
+
+    # Robot arrow
+    rx, ry = world_to_map_px(robot_xy, map_x0, map_y0, map_w, map_h, world_min, world_max)
+    head = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], dtype=np.float32)
+    left = np.array([math.cos(robot_yaw + 2.5), math.sin(robot_yaw + 2.5)], dtype=np.float32)
+    right = np.array([math.cos(robot_yaw - 2.5), math.sin(robot_yaw - 2.5)], dtype=np.float32)
+    scale = 12.0
+    tri = [
+        (rx + int(head[0] * scale), ry - int(head[1] * scale)),
+        (rx + int(left[0] * scale * 0.8), ry - int(left[1] * scale * 0.8)),
+        (rx + int(right[0] * scale * 0.8), ry - int(right[1] * scale * 0.8)),
+    ]
+    draw.polygon(tri, fill=(255, 255, 255), outline=(10, 10, 10))
+    draw.text((map_x0, map_y0 - 16), "World map", fill=(200, 200, 200))
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--jepa_ckpt", required=True)
+    parser.add_argument("--head_ckpt", required=True)
+    parser.add_argument("--ppo_ckpt", required=True)
+    parser.add_argument("--n_steps", type=int, default=1200)
+    parser.add_argument("--cands", type=int, default=384)
+    parser.add_argument("--horizon", type=int, default=15)
+    parser.add_argument("--dist_thresh", type=float, default=0.72)
+    parser.add_argument("--route", type=str, default="1,2,3,2,1")
+    parser.add_argument("--out", type=str, default="jepa_logs/proof_of_thinking_v4_extended.mp4")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--disable_kidnap", action="store_true")
+    parser.add_argument("--kidnap_on_route_idx", type=int, default=3,
+                        help="1-based target index within the route on which to trigger a kidnap event")
+    parser.add_argument("--kidnap_after_leg_steps", type=int, default=45)
+    parser.add_argument("--kidnap_dx", type=float, default=-0.55)
+    parser.add_argument("--kidnap_dy", type=float, default=-0.45)
+    parser.add_argument("--kidnap_dyaw_deg", type=float, default=95.0)
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    waypoints = make_waypoints()
+    route = parse_route(args.route, len(waypoints))
+
+    jepa = TinyQuadJEPA().to(dev)
+    jepa.load_state_dict(clean_state_dict(torch.load(args.jepa_ckpt, map_location=dev)["model_state_dict"]))
+    jepa.eval()
+
+    head = GoalEnergyHead().to(dev)
+    head.load_state_dict(clean_state_dict(torch.load(args.head_ckpt, map_location=dev)["energy_head_state_dict"]))
+    head.eval()
+
+    ppo = ActorCritic().to(dev)
+    ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=dev)["model"], strict=False)
+    ppo.eval()
+
+    scene, robot, cb, ce, c3, dofs, q0 = init_scene(dev, waypoints)
+
+    print("🎬 Harvesting latent breadcrumbs (approach-aligned, averaged)...")
+    latent_breadcrumbs = []
+    for i, wp in enumerate(waypoints, start=1):
+        print(f"  Waypoint {i}: {wp.pos[:2]} via approach {wp.approach_dir_xy}")
+        latent_breadcrumbs.append(harvest_breadcrumb(robot, cb, q0, jepa, ppo, dofs, dev, scene, wp, n_avg=5, warmup=10))
+
+    robot.set_pos(np.array([0.0, 0.0, 0.12], dtype=np.float32))
+    robot.set_quat(yaw_to_quat(0.0))
+    robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
     for _ in range(20):
         scene.step()
 
-    video_writer = imageio.get_writer(args.out, fps=30)
-    prev_action = torch.zeros((1, 12), device=device)
-    prev_best_cmd = torch.zeros((1, 3), device=device)
-    h_exec = torch.zeros((1, 256), device=device)
-    last_plan_stats = {
-        "best_total_cost": float("nan"),
-        "best_latent_cost": float("nan"),
-        "candidate_cost_min": float("nan"),
-        "candidate_cost_mean": float("nan"),
-        "candidate_cost_max": float("nan"),
-    }
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    writer = imageio.get_writer(args.out, fps=30)
 
-    target_idx = 0
-    z_goal = waypoints_z[target_idx:target_idx + 1]
-    goal_pos_np = waypoints_pos_np[target_idx].copy()
-    goal_yaw = float(waypoints_yaw_np[target_idx])
+    pa = torch.zeros((1, 12), device=dev)
+    prev_cmd = None
+    route_ptr = 0
+    target_wp_idx = route[route_ptr]
+    ema_energy = 0.0
+    ema_alpha = 0.30
+    energy_history: List[float] = []
+    trail: List[np.ndarray] = []
+    visit_counts: Dict[int, int] = {i: 0 for i in range(len(waypoints))}
+    kidnap_used = False
+    kidnap_flash = 0
+    leg_steps = 0
 
-    steps_taken = 0
-    replans = 0
-    reached = 0
-    completed = False
-    latent_cost_history = []
-    dist_history = []
-    yaw_err_history = []
+    route_str_human = " -> ".join([f"W{i + 1}" for i in route])
+    print(f"\n🐕 Running expanded landmark navigation ({args.n_steps} steps)")
+    print(f"   Route: {route_str_human}")
+    if not args.disable_kidnap:
+        print(f"   Kidnap event: route target #{args.kidnap_on_route_idx} after {args.kidnap_after_leg_steps} steps")
 
-    ckpt_epoch = int(jepa_ckpt.get("epoch", -1)) + 1 if isinstance(jepa_ckpt.get("epoch", None), int) else jepa_ckpt.get("epoch", "Unknown")
-    ckpt_step = int(jepa_ckpt.get("batch_idx", -1)) + 1 if isinstance(jepa_ckpt.get("batch_idx", None), int) else jepa_ckpt.get("batch_idx", "Unknown")
+    for step in range(args.n_steps):
+        target_wp_idx = route[route_ptr]
 
-    print(f"\n🐕 Running open-floor JEPA navigation demo for up to {args.steps} steps...\n")
+        cep, cel, ceu, c3p, c3l, c3u = move_cams(robot, cb, ce, c3)
+        v, p = get_jepa_state(robot, cb, q0, pa, dofs, dev)
 
-    try:
-        for step_count in range(args.steps):
-            loop_start = time.perf_counter()
-            steps_taken = step_count + 1
+        with torch.no_grad():
+            zc = jepa.encoder(v, p).detach()
+            raw_energy = float(head(zc, latent_breadcrumbs[target_wp_idx]).item())
 
-            cam_3rd_pos, look_at_pt = move_cameras(robot, cam_brain, cam_ego_vis, cam_3rd, goal_pos_np)
-            vis_t, prop_t = get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device)
+        ema_energy = ema_alpha * raw_energy + (1.0 - ema_alpha) * ema_energy
+        energy_history.append(ema_energy)
 
-            with torch.no_grad():
-                z_current = jepa.encoder(vis_t, prop_t)
+        rp = robot.get_pos().cpu().numpy()
+        rq = robot.get_quat().cpu().numpy()
+        if rp.ndim > 1:
+            rp = rp[0]
+        if rq.ndim > 1:
+            rq = rq[0]
 
-            r_pos_current = robot.get_pos().cpu().numpy()
-            r_quat_current = robot.get_quat().cpu().numpy()
-            if r_pos_current.ndim > 1:
-                r_pos_current = r_pos_current[0]
-                r_quat_current = r_quat_current[0]
-            yaw_now = quat_to_yaw_wxyz_np(r_quat_current)
-            yaw_err = abs(angle_wrap(yaw_now - goal_yaw))
-            dist_to_goal = float(np.linalg.norm(r_pos_current[:2] - goal_pos_np[:2]))
+        trail.append(rp[:2].copy())
 
-            if dist_to_goal < args.reach_tol and yaw_err < args.yaw_tol:
-                if target_idx < len(waypoints_pos_np) - 1:
-                    target_idx += 1
-                    reached = target_idx
-                    z_goal = waypoints_z[target_idx:target_idx + 1]
-                    goal_pos_np = waypoints_pos_np[target_idx].copy()
-                    goal_yaw = float(waypoints_yaw_np[target_idx])
-                    print(f"\n✅ Reached waypoint {target_idx}/{len(waypoints_pos_np)}. Advancing...")
-                else:
-                    completed = True
-                    reached = len(waypoints_pos_np)
-                    print("\n\n🎉 Final waypoint reached. Demo complete.")
-                    break
+        goal_xy = waypoints[target_wp_idx].pos[:2]
+        dist = float(np.linalg.norm(rp[:2] - goal_xy))
 
-            if step_count % args.plan_freq == 0:
-                best_cmd, plan_stats = plan_best_cmd(
-                    jepa=jepa,
-                    z_current=z_current,
-                    z_goal=z_goal,
-                    h_exec=h_exec,
-                    prev_best_cmd=prev_best_cmd,
-                    candidates=args.candidates,
-                    horizon=args.horizon,
-                    device=device,
-                )
-                prev_best_cmd = best_cmd.clone()
-                last_plan_stats = plan_stats
-                replans += 1
-            else:
-                best_cmd = prev_best_cmd
-                plan_stats = last_plan_stats
+        if dist < args.dist_thresh:
+            visit_counts[target_wp_idx] += 1
+            print(f"\n✅ Route target {route_ptr + 1}/{len(route)} = W{target_wp_idx + 1} reached at step {step} | dist={dist:.2f} | ema_eng={ema_energy:.2f}")
+            if route_ptr == len(route) - 1:
+                print(f"\n🎉 Full expanded route complete! Final step={step}")
+                break
+            route_ptr += 1
+            target_wp_idx = route[route_ptr]
+            ema_energy = 4.0
+            prev_cmd = None
+            leg_steps = 0
+            goal_xy = waypoints[target_wp_idx].pos[:2]
+            dist = float(np.linalg.norm(rp[:2] - goal_xy))
 
-            with torch.no_grad():
-                _, h_exec = jepa.predictor(z_current, best_cmd, h_exec)
-                sys1_obs = get_system1_obs(robot, q0, prev_action, best_cmd, act_dofs, device)
-                action = ppo.act_deterministic(sys1_obs)
-                prev_action = action.clone()
+        yaw = math.atan2(
+            2.0 * (float(rq[0]) * float(rq[3]) + float(rq[1]) * float(rq[2])),
+            1.0 - 2.0 * (float(rq[2]) ** 2 + float(rq[3]) ** 2),
+        )
 
-            q_tgt = q0.unsqueeze(0) + action_scale * action
-            robot.control_dofs_position(q_tgt[0].detach().to(gs.device), act_dofs)
-            for _ in range(4):
+        if (not args.disable_kidnap and not kidnap_used and (route_ptr + 1) == args.kidnap_on_route_idx
+                and leg_steps >= args.kidnap_after_leg_steps):
+            new_xy = rp[:2] + np.array([args.kidnap_dx, args.kidnap_dy], dtype=np.float32)
+            new_xy[0] = clamp(float(new_xy[0]), -1.8, 2.8)
+            new_xy[1] = clamp(float(new_xy[1]), -0.8, 2.8)
+            new_yaw = wrap_to_pi(yaw + math.radians(args.kidnap_dyaw_deg))
+            robot.set_pos(np.array([new_xy[0], new_xy[1], 0.12], dtype=np.float32))
+            robot.set_quat(yaw_to_quat(new_yaw))
+            robot.set_dofs_position(robot.get_dofs_position(dofs).detach().cpu().numpy(), dofs)
+            for _ in range(12):
                 scene.step()
+            kidnap_used = True
+            kidnap_flash = 70
+            prev_cmd = None
+            print(f"\n🌀 Kidnap event triggered on route target {route_ptr + 1}: moved robot to ({new_xy[0]:.2f}, {new_xy[1]:.2f}) yaw={math.degrees(new_yaw):+.0f}°")
+            continue
 
-            img_ego = render_camera_rgb(cam_ego_vis)
-            img_3rd = render_camera_rgb(cam_3rd)
-            img_3rd_pil = Image.fromarray(img_3rd)
-            draw_goal_marker(img_3rd_pil, cam_3rd_pos, look_at_pt, goal_pos_np)
+        goal_vec = goal_xy - rp[:2]
+        goal_angle = math.atan2(float(goal_vec[1]), float(goal_vec[0]))
+        heading_error = wrap_to_pi(goal_angle - yaw)
+        goal_dir_world = goal_vec / max(float(np.linalg.norm(goal_vec)), 1e-8)
+        goal_body_xy = world_to_body_xy(yaw, goal_dir_world)
 
-            latent_cost_history.append(plan_stats["best_latent_cost"])
-            dist_history.append(dist_to_goal)
-            yaw_err_history.append(yaw_err)
+        cmd, st = plan_best_cmd(
+            jepa=jepa,
+            head=head,
+            zc=zc,
+            zg=latent_breadcrumbs[target_wp_idx],
+            robot_xy=rp[:2].copy(),
+            robot_yaw=yaw,
+            goal_xy=goal_xy.copy(),
+            goal_body_xy=goal_body_xy.copy(),
+            dist_to_goal=dist,
+            heading_error=heading_error,
+            cands=args.cands,
+            hz=args.horizon,
+            dev=dev,
+            prev=prev_cmd,
+        )
+        prev_cmd = cmd.clone()
 
-            hz = 1.0 / max(time.perf_counter() - loop_start, 1e-6)
-            hud_lines = [
-                f"Checkpoint: epoch={ckpt_epoch} step={ckpt_step}",
-                f"Waypoint: {target_idx + 1}/{len(waypoints_pos_np)}   reached={reached}",
-                f"Distance: {dist_to_goal:.3f} m   yaw err: {yaw_err:.2f} rad",
-                f"Cmd: vx={best_cmd[0,0]:+.2f} vy={best_cmd[0,1]:+.2f} wz={best_cmd[0,2]:+.2f}",
-                f"Latent cost: {plan_stats['best_latent_cost']:.3f}   total: {plan_stats['best_total_cost']:.3f}",
-                f"Planner mean/min cost: {plan_stats['candidate_cost_mean']:.3f} / {plan_stats['candidate_cost_min']:.3f}",
-                f"Replans: {replans}   sim loop: {hz:5.1f} Hz",
-            ]
-            frame = compose_frame(img_ego, np.array(img_3rd_pil), hud_lines)
-            video_writer.append_data(frame)
+        with torch.no_grad():
+            pa = ppo.act_deterministic(get_sys1_obs(robot, q0, pa, cmd, dofs, dev)).detach()
+        target = to_genesis_target(q0 + 0.3 * pa[0])
+        robot.control_dofs_position(target, dofs)
+        for _ in range(4):
+            scene.step()
+        leg_steps += 1
 
-            print(
-                f"\r⚡ step={step_count+1:04d}/{args.steps} | wpt={target_idx+1:02d}/{len(waypoints_pos_np)} "
-                f"| dist={dist_to_goal:.3f} | yaw={yaw_err:.2f} "
-                f"| cmd=[{best_cmd[0,0]:+.2f}, {best_cmd[0,1]:+.2f}, {best_cmd[0,2]:+.2f}] "
-                f"| latent={plan_stats['best_latent_cost']:.3f} | hz={hz:4.1f}",
-                end="",
-            )
+        frame3 = c3.render()[0]
+        if hasattr(frame3, "cpu"):
+            frame3 = frame3.cpu().numpy()
+        p3 = Image.fromarray(frame3[:, :, :3].astype(np.uint8))
 
-    except KeyboardInterrupt:
-        print("\n\n🛑 Simulation interrupted.")
-    finally:
-        video_writer.close()
+        frame_e = ce.render()[0]
+        if hasattr(frame_e, "cpu"):
+            frame_e = frame_e.cpu().numpy()
+        pe = Image.fromarray(frame_e[:, :, :3].astype(np.uint8))
 
-    final_pos = robot.get_pos().cpu().numpy()
-    final_quat = robot.get_quat().cpu().numpy()
-    if final_pos.ndim > 1:
-        final_pos = final_pos[0]
-        final_quat = final_quat[0]
-    final_goal_dist = float(np.linalg.norm(final_pos[:2] - goal_pos_np[:2]))
-    final_yaw_err = float(abs(angle_wrap(quat_to_yaw_wxyz_np(final_quat) - goal_yaw)))
+        d3 = ImageDraw.Draw(p3)
+        h_px = [
+            project_world_to_pixel(np.array([pt[0], pt[1], 0.05], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
+            for pt in st["path"]
+        ]
+        valid_px = [px for px in h_px if px is not None]
+        if len(valid_px) > 1:
+            d3.line(valid_px, fill=(0, 150, 255), width=4)
 
-    summary = {
-        "jepa_ckpt": args.jepa_ckpt,
-        "ppo_ckpt": args.ppo_ckpt,
-        "epoch": ckpt_epoch,
-        "step": ckpt_step,
-        "steps_budget": args.steps,
-        "steps_taken": steps_taken,
-        "completed": completed,
-        "waypoints_total": int(len(waypoints_pos_np)),
-        "waypoints_reached": int(reached),
-        "waypoint_fraction": float(reached / max(len(waypoints_pos_np), 1)),
-        "replans": int(replans),
-        "final_goal_dist": final_goal_dist,
-        "final_yaw_err": final_yaw_err,
-        "mean_latent_cost": float(np.nanmean(latent_cost_history)) if latent_cost_history else float("nan"),
-        "mean_goal_dist": float(np.nanmean(dist_history)) if dist_history else float("nan"),
-        "mean_yaw_err": float(np.nanmean(yaw_err_history)) if yaw_err_history else float("nan"),
-        "video_path": args.out,
-    }
+        lm_colors_draw = [(255, 80, 80), (80, 255, 80), (80, 130, 255)]
+        completed_target_positions = set(route[:route_ptr])
+        for wi, wp in enumerate(waypoints):
+            px = project_world_to_pixel(wp.pos, c3p, c3l, c3u, 50, 512, 512)
+            if px is None:
+                continue
+            done = wi in completed_target_positions
+            col = (100, 100, 100) if done else lm_colors_draw[wi]
+            if wi == target_wp_idx:
+                col = (255, 255, 255)
+            d3.ellipse([px[0] - 12, px[1] - 12, px[0] + 12, px[1] + 12], outline=col, width=3)
+            label = f"W{wi + 1} x{visit_counts[wi]}"
+            d3.text((px[0] + 16, px[1] - 6), label, fill=col)
 
-    if args.summary_json:
-        os.makedirs(os.path.dirname(args.summary_json) or ".", exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
-        print(f"\n💾 Summary written to {args.summary_json}")
+        header_h = 176
+        canv = Image.new("RGB", (896, header_h + 512), (20, 20, 20))
+        canv.paste(p3, (0, header_h))
+        canv.paste(pe, (512, header_h))
 
-    print(f"\n✅ Video saved as {args.out}")
-    print("📊 Summary:")
-    print(json.dumps(summary, indent=2))
+        drw = ImageDraw.Draw(canv)
+
+        # Dedicated top header band for HUDs so the camera panes stay unobstructed
+        drw.rectangle([0, 0, 895, header_h - 1], fill=(10, 10, 10), outline=(55, 55, 55))
+        drw.line([(0, header_h - 1), (895, header_h - 1)], fill=(90, 90, 90), width=2)
+
+        # Pane outlines / labels
+        drw.rectangle([0, header_h, 511, header_h + 511], outline=(70, 70, 70), width=2)
+        drw.rectangle([512, header_h, 895, header_h + 383], outline=(70, 70, 70), width=2)
+        drw.text((12, header_h - 22), "World view + planner rollout", fill=(190, 190, 190))
+        drw.text((524, header_h - 22), "Agent / close-up view", fill=(190, 190, 190))
+
+        title = "JEPA | Expanded Landmark Demo"
+        if kidnap_flash > 0:
+            title += " | RECOVERY"
+            kidnap_flash -= 1
+        drw.text((20, 16), title, fill=(0, 255, 100))
+        drw.text((20, 36), f"Step: {step:04d} | Route target: {route_ptr + 1}/{len(route)} | Active: W{target_wp_idx + 1} ({waypoints[target_wp_idx].name})", fill=(200, 200, 200))
+        drw.text((20, 56), f"Route: {route_str_human}", fill=(160, 160, 160))
+        drw.text((20, 76), f"Dist: {dist:.2f}m | Heading err: {np.degrees(heading_error):+.0f}° | Leg steps: {leg_steps}", fill=(200, 200, 200))
+        drw.text((20, 96), f"Raw E: {raw_energy:.2f} | EMA E: {ema_energy:.2f} | Plan cost: {st['cost']:.2f}", fill=(200, 200, 200))
+        drw.text((20, 116), f"Cmd: vx={float(cmd[0, 0].item()):+.2f} vy={float(cmd[0, 1].item()):+.2f} wz={float(cmd[0, 2].item()):+.2f}", fill=(200, 200, 200))
+
+        draw_energy_bar(drw, 20, 140, 160, 12, raw_energy, "raw", color=(200, 80, 40))
+        draw_energy_bar(drw, 20, 158, 160, 12, ema_energy, "ema", color=(0, 180, 120))
+        draw_progress_bar(drw, 220, 146, 220, 12, route_ptr / max(len(route) - 1, 1), "Route completion", color=(120, 180, 255))
+
+        if len(energy_history) > 2:
+            hist = energy_history[-80:]
+            hist_arr = np.asarray(hist, dtype=np.float32)
+            h_min = float(hist_arr.min())
+            h_max = max(float(hist_arr.max()), h_min + 0.1)
+            pts = []
+            for i, val in enumerate(hist_arr):
+                x_px = 20 + int(i / len(hist_arr) * 420)
+                y_px = 170 - int((float(val) - h_min) / (h_max - h_min) * 34)
+                pts.append((x_px, y_px))
+            if len(pts) > 1:
+                drw.line(pts, fill=(0, 200, 255), width=2)
+            drw.text((20, 124), "EMA energy history", fill=(180, 180, 180))
+
+        draw_minimap(
+            drw,
+            map_x0=540,
+            map_y0=22,
+            map_w=322,
+            map_h=134,
+            waypoints=waypoints,
+            route=route,
+            route_ptr=route_ptr,
+            robot_xy=rp[:2],
+            robot_yaw=yaw,
+            trail=trail,
+            plan_path=st["path"],
+            visit_counts=visit_counts,
+        )
+
+        footer = "Blue = planned rollout | Yellow = actual trail | White = active target"
+        if not args.disable_kidnap:
+            footer += " | Recovery event enabled"
+        drw.text((540, 160), footer, fill=(120, 120, 120))
+
+        if kidnap_flash > 0:
+            drw.rounded_rectangle([540, 160, 872, 172], radius=6, fill=(110, 40, 10), outline=(255, 190, 80), width=2)
+            drw.text((550, 159), "Replanning after kidnap event", fill=(255, 240, 180))
+
+        writer.append_data(np.array(canv))
+        print(f"\r⚡ step={step:03d} | route={route_ptr + 1}/{len(route)} | wp={target_wp_idx + 1} | dist={dist:.2f} | ema_E={ema_energy:.2f} | hdg={np.degrees(heading_error):+.0f}°", end="")
+
+    writer.close()
+    print(f"\n\n✅ Demo saved to {args.out}")
+    print(f"   Route completion: {route_ptr + 1}/{len(route)} targets")
+    print(f"   Visit counts: " + ", ".join([f"W{i + 1}={visit_counts[i]}" for i in range(len(waypoints))]))
 
 
 if __name__ == "__main__":

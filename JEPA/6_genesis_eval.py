@@ -22,7 +22,7 @@ import argparse
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import imageio
 import numpy as np
@@ -240,7 +240,6 @@ def to_genesis_target(x: torch.Tensor) -> torch.Tensor:
 # Genesis scene + observations
 # ----------------------------------------------------------------------------
 
-
 def init_scene(device: torch.device, waypoints: List[WaypointSpec]):
     gs.init(backend=gs.cpu)
     scene = gs.Scene(show_viewer=False)
@@ -377,7 +376,6 @@ def project_world_to_pixel(wp: np.ndarray, cp: np.ndarray, cl: np.ndarray, cu: n
 # ----------------------------------------------------------------------------
 # Planning / breadcrumb harvesting
 # ----------------------------------------------------------------------------
-
 
 def rollout_cmd_kinematic(start_xy: np.ndarray, start_yaw: float, cmd_xyw: np.ndarray, hz: int, dt: float = 0.10):
     pos = np.array(start_xy, dtype=np.float32).copy()
@@ -531,7 +529,6 @@ def harvest_breadcrumb(
 # HUD helpers
 # ----------------------------------------------------------------------------
 
-
 def draw_energy_bar(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, energy: float, label: str, color=(0, 200, 100)):
     draw.rectangle([x, y, x + w, y + h], outline=(80, 80, 80), fill=(30, 30, 30))
     frac = max(0.0, min(1.0, energy / 4.0))
@@ -558,6 +555,38 @@ def world_to_map_px(xy: np.ndarray, map_x0: int, map_y0: int, map_w: int, map_h:
     return px, py
 
 
+def draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    p_from: Tuple[int, int],
+    p_to: Tuple[int, int],
+    dash: int = 7,
+    gap: int = 5,
+    fill: Tuple[int, int, int] = (255, 220, 110),
+    width: int = 3,
+):
+    x0, y0 = p_from
+    x1, y1 = p_to
+    dx = x1 - x0
+    dy = y1 - y0
+    dist = math.hypot(dx, dy)
+    if dist <= 1e-6:
+        return
+
+    ux = dx / dist
+    uy = dy / dist
+    step = dash + gap
+    t = 0.0
+
+    while t < dist:
+        t_end = min(t + dash, dist)
+        xa = x0 + ux * t
+        ya = y0 + uy * t
+        xb = x0 + ux * t_end
+        yb = y0 + uy * t_end
+        draw.line((xa, ya, xb, yb), fill=fill, width=width)
+        t += step
+
+
 def draw_minimap(
     draw: ImageDraw.ImageDraw,
     map_x0: int,
@@ -572,13 +601,16 @@ def draw_minimap(
     trail: List[np.ndarray],
     plan_path: np.ndarray,
     visit_counts: Dict[int, int],
+    dist_thresh: float,
+    teleport_from_xy: Optional[np.ndarray] = None,
+    teleport_to_xy: Optional[np.ndarray] = None,
+    teleport_flash: int = 0,
 ):
     world_min = np.array([-2.2, -1.2], dtype=np.float32)
     world_max = np.array([3.8, 3.8], dtype=np.float32)
 
     draw.rectangle([map_x0, map_y0, map_x0 + map_w, map_y0 + map_h], fill=(18, 18, 18), outline=(95, 95, 95))
 
-    # Floor grid
     for gx in np.linspace(world_min[0], world_max[0], 7):
         p0 = world_to_map_px(np.array([gx, world_min[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
         p1 = world_to_map_px(np.array([gx, world_max[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
@@ -590,31 +622,50 @@ def draw_minimap(
 
     route_colors = [(255, 80, 80), (80, 255, 80), (80, 140, 255)]
 
-    # Route polyline
+    world_span_x = float(world_max[0] - world_min[0])
+    world_span_y = float(world_max[1] - world_min[1])
+    px_per_m_x = map_w / max(world_span_x, 1e-8)
+    px_per_m_y = map_h / max(world_span_y, 1e-8)
+    goal_r_px = max(3, int(dist_thresh * 0.5 * (px_per_m_x + px_per_m_y)))
+
     if len(route) > 1:
         pts = [world_to_map_px(waypoints[idx].pos[:2], map_x0, map_y0, map_w, map_h, world_min, world_max) for idx in route]
         draw.line(pts, fill=(120, 120, 120), width=2)
 
-    # Trail
     if len(trail) > 1:
         trail_pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h, world_min, world_max) for t in trail[-240:]]
         if len(trail_pts) > 1:
             draw.line(trail_pts, fill=(255, 214, 10), width=2)
 
-    # Planned rollout
     if plan_path is not None and len(plan_path) > 1:
         plan_pts = [world_to_map_px(pt, map_x0, map_y0, map_w, map_h, world_min, world_max) for pt in plan_path]
         draw.line(plan_pts, fill=(0, 170, 255), width=3)
 
-    # Waypoints and visit counts
+    active_idx = route[route_ptr]
     for wi, wp in enumerate(waypoints):
         px, py = world_to_map_px(wp.pos[:2], map_x0, map_y0, map_w, map_h, world_min, world_max)
         col = route_colors[wi]
-        r = 8 if wi == route[route_ptr] else 6
+        ring_col = (255, 255, 255) if wi == active_idx else (90, 90, 90)
+        draw.ellipse([px - goal_r_px, py - goal_r_px, px + goal_r_px, py + goal_r_px], outline=ring_col, width=2)
+        r = 8 if wi == active_idx else 6
         draw.ellipse([px - r, py - r, px + r, py + r], fill=col, outline=(230, 230, 230), width=1)
-        draw.text((px + 10, py - 8), f"W{wi + 1} x{visit_counts.get(wi, 0)}", fill=col)
+        draw.text((px + goal_r_px + 6, py - 8), f"W{wi + 1} x{visit_counts.get(wi, 0)}", fill=col)
 
-    # Robot arrow
+    if teleport_flash > 0 and teleport_from_xy is not None and teleport_to_xy is not None:
+        p_from = world_to_map_px(np.asarray(teleport_from_xy, dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        p_to = world_to_map_px(np.asarray(teleport_to_xy, dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        draw_dashed_line(draw, p_from, p_to, dash=7, gap=5, fill=(255, 220, 110), width=3)
+        for px, py, fill_col, lab in [
+            (p_from[0], p_from[1], (255, 120, 80), "before"),
+            (p_to[0], p_to[1], (255, 230, 120), "after"),
+        ]:
+            draw.ellipse([px - 8, py - 8, px + 8, py + 8], fill=fill_col, outline=(255, 255, 255), width=2)
+            draw.text((px + 10, py - 10), lab, fill=fill_col)
+        mx0 = map_x0 + 8
+        my0 = map_y0 + map_h - 24
+        draw.rounded_rectangle([mx0, my0, mx0 + 196, my0 + 18], radius=5, fill=(88, 28, 10), outline=(255, 200, 100), width=2)
+        draw.text((mx0 + 8, my0 + 2), "teleport / relocalize", fill=(255, 235, 190))
+
     rx, ry = world_to_map_px(robot_xy, map_x0, map_y0, map_w, map_h, world_min, world_max)
     head = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], dtype=np.float32)
     left = np.array([math.cos(robot_yaw + 2.5), math.sin(robot_yaw + 2.5)], dtype=np.float32)
@@ -633,7 +684,6 @@ def draw_minimap(
 # Main
 # ----------------------------------------------------------------------------
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--jepa_ckpt", required=True)
@@ -642,7 +692,7 @@ def main():
     parser.add_argument("--n_steps", type=int, default=1200)
     parser.add_argument("--cands", type=int, default=384)
     parser.add_argument("--horizon", type=int, default=15)
-    parser.add_argument("--dist_thresh", type=float, default=0.72)
+    parser.add_argument("--dist_thresh", type=float, default=0.45)
     parser.add_argument("--route", type=str, default="1,2,3,2,1")
     parser.add_argument("--out", type=str, default="jepa_logs/proof_of_thinking_v4_extended.mp4")
     parser.add_argument("--seed", type=int, default=0)
@@ -653,6 +703,8 @@ def main():
     parser.add_argument("--kidnap_dx", type=float, default=-0.55)
     parser.add_argument("--kidnap_dy", type=float, default=-0.45)
     parser.add_argument("--kidnap_dyaw_deg", type=float, default=95.0)
+    parser.add_argument("--teleport_banner_frames", type=int, default=60)
+    parser.add_argument("--teleport_freeze_frames", type=int, default=10)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -702,6 +754,9 @@ def main():
     visit_counts: Dict[int, int] = {i: 0 for i in range(len(waypoints))}
     kidnap_used = False
     kidnap_flash = 0
+    kidnap_from_xy = None
+    kidnap_to_xy = None
+    kidnap_freeze_pending = 0
     leg_steps = 0
 
     route_str_human = " -> ".join([f"W{i + 1}" for i in route])
@@ -756,6 +811,7 @@ def main():
 
         if (not args.disable_kidnap and not kidnap_used and (route_ptr + 1) == args.kidnap_on_route_idx
                 and leg_steps >= args.kidnap_after_leg_steps):
+            old_xy = rp[:2].copy()
             new_xy = rp[:2] + np.array([args.kidnap_dx, args.kidnap_dy], dtype=np.float32)
             new_xy[0] = clamp(float(new_xy[0]), -1.8, 2.8)
             new_xy[1] = clamp(float(new_xy[1]), -0.8, 2.8)
@@ -766,7 +822,10 @@ def main():
             for _ in range(12):
                 scene.step()
             kidnap_used = True
-            kidnap_flash = 70
+            kidnap_flash = args.teleport_banner_frames
+            kidnap_from_xy = old_xy
+            kidnap_to_xy = new_xy.copy()
+            kidnap_freeze_pending = args.teleport_freeze_frames
             prev_cmd = None
             print(f"\n🌀 Kidnap event triggered on route target {route_ptr + 1}: moved robot to ({new_xy[0]:.2f}, {new_xy[1]:.2f}) yaw={math.degrees(new_yaw):+.0f}°")
             continue
@@ -842,12 +901,11 @@ def main():
         canv.paste(pe, (512, header_h))
 
         drw = ImageDraw.Draw(canv)
+        drw_rgba = ImageDraw.Draw(canv, "RGBA")
 
-        # Dedicated top header band for HUDs so the camera panes stay unobstructed
         drw.rectangle([0, 0, 895, header_h - 1], fill=(10, 10, 10), outline=(55, 55, 55))
         drw.line([(0, header_h - 1), (895, header_h - 1)], fill=(90, 90, 90), width=2)
 
-        # Pane outlines / labels
         drw.rectangle([0, header_h, 511, header_h + 511], outline=(70, 70, 70), width=2)
         drw.rectangle([512, header_h, 895, header_h + 383], outline=(70, 70, 70), width=2)
         drw.text((12, header_h - 22), "World view + planner rollout", fill=(190, 190, 190))
@@ -856,11 +914,10 @@ def main():
         title = "JEPA | Expanded Landmark Demo"
         if kidnap_flash > 0:
             title += " | RECOVERY"
-            kidnap_flash -= 1
         drw.text((20, 16), title, fill=(0, 255, 100))
         drw.text((20, 36), f"Step: {step:04d} | Route target: {route_ptr + 1}/{len(route)} | Active: W{target_wp_idx + 1} ({waypoints[target_wp_idx].name})", fill=(200, 200, 200))
         drw.text((20, 56), f"Route: {route_str_human}", fill=(160, 160, 160))
-        drw.text((20, 76), f"Dist: {dist:.2f}m | Heading err: {np.degrees(heading_error):+.0f}° | Leg steps: {leg_steps}", fill=(200, 200, 200))
+        drw.text((20, 76), f"Dist: {dist:.2f}m | Goal radius: {args.dist_thresh:.2f}m | Heading err: {np.degrees(heading_error):+.0f}° | Leg steps: {leg_steps}", fill=(200, 200, 200))
         drw.text((20, 96), f"Raw E: {raw_energy:.2f} | EMA E: {ema_energy:.2f} | Plan cost: {st['cost']:.2f}", fill=(200, 200, 200))
         drw.text((20, 116), f"Cmd: vx={float(cmd[0, 0].item()):+.2f} vy={float(cmd[0, 1].item()):+.2f} wz={float(cmd[0, 2].item()):+.2f}", fill=(200, 200, 200))
 
@@ -896,18 +953,34 @@ def main():
             trail=trail,
             plan_path=st["path"],
             visit_counts=visit_counts,
+            dist_thresh=args.dist_thresh,
+            teleport_from_xy=kidnap_from_xy,
+            teleport_to_xy=kidnap_to_xy,
+            teleport_flash=kidnap_flash,
         )
 
-        footer = "Blue = planned rollout | Yellow = actual trail | White = active target"
+        footer = "Blue = planned rollout | Yellow = actual trail | White ring = active goal radius"
         if not args.disable_kidnap:
             footer += " | Recovery event enabled"
         drw.text((540, 160), footer, fill=(120, 120, 120))
 
+        freeze_now = kidnap_freeze_pending > 0
         if kidnap_flash > 0:
-            drw.rounded_rectangle([540, 160, 872, 172], radius=6, fill=(110, 40, 10), outline=(255, 190, 80), width=2)
-            drw.text((550, 159), "Replanning after kidnap event", fill=(255, 240, 180))
+            drw_rgba.rectangle([0, header_h, 895, header_h + 511], fill=(120, 38, 0, 34))
+            drw.rounded_rectangle([8, 4, 888, 48], radius=10, fill=(92, 26, 8), outline=(255, 205, 110), width=3)
+            drw.text((22, 12), f"RELOCALIZATION TEST: robot teleported while pursuing W{target_wp_idx + 1}", fill=(255, 242, 214))
+            drw.text((22, 28), "Why it matters: the demo is testing whether latent goal memory supports recovery after unexpected displacement.", fill=(255, 220, 168))
+            drw.rounded_rectangle([170, header_h + 208, 726, header_h + 286], radius=12, fill=(90, 24, 8), outline=(255, 205, 110), width=4)
+            drw.text((212, header_h + 228), "TELEPORT / RELOCALIZE EVENT", fill=(255, 244, 220))
+            drw.text((202, header_h + 250), f"Unexpected displacement -> replanning to W{target_wp_idx + 1}", fill=(255, 224, 176))
+            kidnap_flash -= 1
 
-        writer.append_data(np.array(canv))
+        frame_np = np.array(canv)
+        writer.append_data(frame_np)
+        if freeze_now:
+            for _ in range(kidnap_freeze_pending):
+                writer.append_data(frame_np)
+            kidnap_freeze_pending = 0
         print(f"\r⚡ step={step:03d} | route={route_ptr + 1}/{len(route)} | wp={target_wp_idx + 1} | dist={dist:.2f} | ema_E={ema_energy:.2f} | hdg={np.degrees(heading_error):+.0f}°", end="")
 
     writer.close()

@@ -22,6 +22,7 @@ import argparse
 import heapq
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -588,25 +589,48 @@ def compute_distance_field(start: Tuple[int, int], occ: np.ndarray) -> np.ndarra
 
 
 def choose_frontier_target(visited: np.ndarray, occ: np.ndarray, robot_xy: np.ndarray) -> Optional[FrontierTarget]:
+    """
+    Cheap, deterministic frontier chooser.
+
+    Why this exists:
+    - the earlier version used a full distance-field solve during frontier selection
+    - in practice, that stage appears to be where some runs stall before the first step
+    - for a 60x50 map we do not need anything sophisticated here
+
+    Strategy:
+    1. build the frontier mask
+    2. score frontier cells using only local unseen gain + straight-line distance
+    3. if no frontier exists, fall back to any unvisited free cell
+    4. reject cells too close to obstacles so A* gets cleaner goals
+    """
     frontier = compute_frontier_mask(visited, occ)
-    dist_field = compute_distance_field(world_to_grid(robot_xy), occ)
     cells = np.argwhere(frontier)
     if len(cells) == 0:
-        remaining = np.argwhere((~occ) & (~visited))
-        if len(remaining) == 0:
+        cells = np.argwhere((~occ) & (~visited))
+        if len(cells) == 0:
             return None
-        cells = remaining
 
     best_cell = None
     best_score = None
     for gy, gx in cells:
-        if not np.isfinite(dist_field[gy, gx]):
+        gx_i = int(gx)
+        gy_i = int(gy)
+        if occ[gy_i, gx_i]:
             continue
-        gain = local_unseen_gain(visited, occ, int(gx), int(gy), rad=2)
-        score = 2.8 * gain - 0.18 * float(dist_field[gy, gx])
+
+        xy = grid_to_world(gx_i, gy_i)
+        euclid = float(np.linalg.norm(xy - robot_xy))
+        gain = float(local_unseen_gain(visited, occ, gx_i, gy_i, rad=2))
+
+        # Avoid selecting cells that sit right on obstacle margins.
+        obs_clear = float(min_clearance_to_obstacles(xy, make_obstacles(), inflate=0.10))
+        if obs_clear < 0.02:
+            continue
+
+        score = 2.8 * gain - 0.55 * euclid + 0.15 * obs_clear
         if best_score is None or score > best_score:
             best_score = score
-            best_cell = (int(gx), int(gy))
+            best_cell = (gx_i, gy_i)
 
     if best_cell is None:
         return None
@@ -971,6 +995,9 @@ def main():
     parser.add_argument("--rollout_horizon", type=int, default=8)
     parser.add_argument("--control_repeat", type=int, default=3)
     parser.add_argument("--ood_bank_samples", type=int, default=128)
+    parser.add_argument("--render_every", type=int, default=1)
+    parser.add_argument("--no_video", action="store_true")
+    parser.add_argument("--debug_first_step", action="store_true")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -1000,8 +1027,10 @@ def main():
     occ, clearance = build_obstacle_grid(obstacles, inflate=0.11)
     visited = np.zeros((MAP_H, MAP_W), dtype=bool)
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    writer = imageio.get_writer(args.out, fps=30)
+    writer = None
+    if not args.no_video:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        writer = imageio.get_writer(args.out, fps=30)
 
     pa = torch.zeros((1, 12), device=dev)
     planner = PlannerState()
@@ -1010,13 +1039,17 @@ def main():
     ood_history: List[float] = []
 
     free_cells = int((~occ).sum())
-    print(f"\n🐕 Running fast exploration demo ({args.n_steps} steps)")
-    print(f"   Free cells: {free_cells} | Coverage goal: {args.coverage_goal:.0%}")
+    print(f"\n🐕 Running fast exploration demo ({args.n_steps} steps)", flush=True)
+    print(f"   Free cells: {free_cells} | Coverage goal: {args.coverage_goal:.0%}", flush=True)
+    print("   Entering control loop...", flush=True)
 
     prev_xy = None
     current_info: Dict[str, float] = {"cost": 0.0, "pred_ood_raw": 0.0, "pred_ood_rel": 0.0, "clearance": 0.0, "collision": 0.0, "novel": 0.0, "frontier_progress": 0.0, "wp_progress": 0.0, "stall": 0.0}
 
     for step in range(args.n_steps):
+        step_t0 = time.perf_counter()
+        if step == 0 and args.debug_first_step:
+            print("   [debug] step 0: move_cams", flush=True)
         cep, cel, ceu, c3p, c3l, c3u = move_cams(robot, cb, ce, c3)
         rp = robot.get_pos().cpu().numpy()
         rq = robot.get_quat().cpu().numpy()
@@ -1043,6 +1076,8 @@ def main():
             1.0 - 2.0 * (float(rq[2]) ** 2 + float(rq[3]) ** 2),
         )
 
+        if step == 0 and args.debug_first_step:
+            print("   [debug] step 0: get_jepa_state", flush=True)
         v, p = get_jepa_state(robot, cb, q0, pa, dofs, dev)
         with torch.no_grad():
             zc = jepa.encoder(v, p).detach()
@@ -1059,6 +1094,8 @@ def main():
         elif planner.stall_count >= args.frontier_stall_steps:
             needs_new_frontier = True
 
+        if step == 0 and args.debug_first_step:
+            print("   [debug] step 0: frontier selection", flush=True)
         if needs_new_frontier:
             planner.frontier = choose_frontier_target(visited, occ, robot_xy)
             planner.path_cells = None
@@ -1075,6 +1112,8 @@ def main():
         if planner.frontier is None:
             break
 
+        if step == 0 and args.debug_first_step:
+            print("   [debug] step 0: path planning / local cmd", flush=True)
         if (
             planner.path_cells is None
             or planner.hold_steps <= 0
@@ -1115,6 +1154,8 @@ def main():
         else:
             planner.stall_count = max(planner.stall_count - 1, 0)
 
+        if step == 0 and args.debug_first_step:
+            print("   [debug] step 0: PPO + physics", flush=True)
         with torch.no_grad():
             pa = ppo.act_deterministic(get_sys1_obs(robot, q0, pa, cmd, dofs, dev)).detach()
         target = to_genesis_target(q0 + 0.3 * pa[0])
@@ -1122,104 +1163,112 @@ def main():
         for _ in range(max(args.control_repeat, 1)):
             scene.step()
 
-        frame3 = c3.render()[0]
-        if hasattr(frame3, "cpu"):
-            frame3 = frame3.cpu().numpy()
-        p3 = Image.fromarray(frame3[:, :, :3].astype(np.uint8))
-
-        frame_e = ce.render()[0]
-        if hasattr(frame_e, "cpu"):
-            frame_e = frame_e.cpu().numpy()
-        pe = Image.fromarray(frame_e[:, :, :3].astype(np.uint8))
-
-        d3 = ImageDraw.Draw(p3)
-        if planner.best_path_xy is not None:
-            path_px = [
-                project_world_to_pixel(np.array([pt[0], pt[1], 0.05], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
-                for pt in planner.best_path_xy
-            ]
-            valid_px = [px for px in path_px if px is not None]
-            if len(valid_px) > 1:
-                d3.line(valid_px, fill=(0, 150, 255), width=4)
-
-        for obs in obstacles:
-            px = project_world_to_pixel(obs.pos, c3p, c3l, c3u, 50, 512, 512)
-            if px is not None:
-                d3.text((px[0] + 6, px[1] - 6), obs.name, fill=(255, 220, 150))
-
-        if planner.frontier is not None:
-            fx = project_world_to_pixel(np.array([planner.frontier.xy[0], planner.frontier.xy[1], 0.08], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
-            if fx is not None:
-                d3.ellipse([fx[0] - 12, fx[1] - 12, fx[0] + 12, fx[1] + 12], outline=(255, 255, 255), width=3)
-                d3.text((fx[0] + 16, fx[1] - 6), "frontier", fill=(255, 255, 255))
-
-        header_h = 192
-        canv = Image.new("RGB", (896, header_h + 512), (20, 20, 20))
-        canv.paste(p3, (0, header_h))
-        canv.paste(pe, (512, header_h))
-
-        drw = ImageDraw.Draw(canv)
-        drw.rectangle([0, 0, 895, header_h - 1], fill=(10, 10, 10), outline=(55, 55, 55))
-        drw.line([(0, header_h - 1), (895, header_h - 1)], fill=(90, 90, 90), width=2)
-        drw.rectangle([0, header_h, 511, header_h + 511], outline=(70, 70, 70), width=2)
-        drw.rectangle([512, header_h, 895, header_h + 383], outline=(70, 70, 70), width=2)
-        drw.text((12, header_h - 22), "World view + local rollout", fill=(190, 190, 190))
-        drw.text((524, header_h - 22), "Agent / close-up view", fill=(190, 190, 190))
-
         frontier_dist = float(np.linalg.norm(planner.frontier.xy - robot_xy)) if planner.frontier is not None else 0.0
-        drw.text((20, 16), "JEPA | Fast Frontier Exploration + OOD Safety", fill=(0, 255, 100))
-        drw.text((20, 36), f"Step: {step:04d} | Coverage: {coverage:.1%} | Frontier switches: {planner.frontier_switches}", fill=(200, 200, 200))
-        drw.text((20, 56), f"Frontier dist: {frontier_dist:.2f} m | OOD raw: {current_ood_raw:.2f} | OOD rel: {current_ood_rel:.2f}", fill=(200, 200, 200))
-        drw.text((20, 76), f"Cmd: vx={float(cmd[0, 0].item()):+.2f} vy={float(cmd[0, 1].item()):+.2f} wz={float(cmd[0, 2].item()):+.2f}", fill=(200, 200, 200))
-        drw.text((20, 96), f"Plan cost: {current_info['cost']:.2f} | Novel(best): {int(current_info['novel'])} | Frontier prog: {current_info['frontier_progress']:+.2f}", fill=(200, 200, 200))
-        drw.text((20, 116), f"Pred OOD raw: {current_info['pred_ood_raw']:.2f} | Pred OOD rel: {current_info['pred_ood_rel']:.2f} | Stall: {current_info['stall']:.2f}", fill=(200, 200, 200))
+        if (not args.no_video) and (step % max(args.render_every, 1) == 0):
+            if step == 0 and args.debug_first_step:
+                print("   [debug] step 0: rendering / video", flush=True)
+            frame3 = c3.render()[0]
+            if hasattr(frame3, "cpu"):
+                frame3 = frame3.cpu().numpy()
+            p3 = Image.fromarray(frame3[:, :, :3].astype(np.uint8))
 
-        draw_bar(drw, 20, 150, 165, 12, current_ood_rel, 3.0, "OOD rel", fill=(220, 90, 40))
-        draw_bar(drw, 220, 150, 165, 12, current_info["pred_ood_rel"], 3.0, "pred OOD rel", fill=(180, 80, 180))
-        draw_progress_bar(drw, 420, 150, 160, 12, coverage, "Coverage", fill=(0, 170, 255))
-        draw_progress_bar(drw, 610, 150, 160, 12, clamp(current_info["novel"] / 8.0, 0.0, 1.0), "Novel cells in local rollout", fill=(100, 210, 120))
+            frame_e = ce.render()[0]
+            if hasattr(frame_e, "cpu"):
+                frame_e = frame_e.cpu().numpy()
+            pe = Image.fromarray(frame_e[:, :, :3].astype(np.uint8))
 
-        if len(ood_history) > 2:
-            hist = np.asarray(ood_history[-90:], dtype=np.float32)
-            hmin = float(hist.min())
-            hmax = max(float(hist.max()), hmin + 0.1)
-            pts = []
-            for i, val in enumerate(hist):
-                x_px = 20 + int(i / max(len(hist) - 1, 1) * 420)
-                y_px = 182 - int((float(val) - hmin) / (hmax - hmin) * 34)
-                pts.append((x_px, y_px))
-            if len(pts) > 1:
-                drw.line(pts, fill=(255, 180, 90), width=2)
-            drw.text((20, 128), "Raw OOD history", fill=(180, 180, 180))
+            d3 = ImageDraw.Draw(p3)
+            if planner.best_path_xy is not None:
+                path_px = [
+                    project_world_to_pixel(np.array([pt[0], pt[1], 0.05], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
+                    for pt in planner.best_path_xy
+                ]
+                valid_px = [px for px in path_px if px is not None]
+                if len(valid_px) > 1:
+                    d3.line(valid_px, fill=(0, 150, 255), width=4)
 
-        draw_minimap(
-            drw,
-            map_x0=540,
-            map_y0=22,
-            map_w=322,
-            map_h=138,
-            robot_xy=robot_xy,
-            robot_yaw=yaw,
-            trail=trail,
-            plan_path=planner.best_path_xy,
-            frontier_xy=planner.frontier.xy if planner.frontier is not None else None,
-            visited=visited,
-            occ=occ,
-            obstacles=obstacles,
-        )
-        drw.text((540, 164), "Blue = local rollout | Yellow = actual trail | White = active frontier", fill=(120, 120, 120))
+            for obs in obstacles:
+                px = project_world_to_pixel(obs.pos, c3p, c3l, c3u, 50, 512, 512)
+                if px is not None:
+                    d3.text((px[0] + 6, px[1] - 6), obs.name, fill=(255, 220, 150))
 
-        writer.append_data(np.array(canv))
+            if planner.frontier is not None:
+                fx = project_world_to_pixel(np.array([planner.frontier.xy[0], planner.frontier.xy[1], 0.08], dtype=np.float32), c3p, c3l, c3u, 50, 512, 512)
+                if fx is not None:
+                    d3.ellipse([fx[0] - 12, fx[1] - 12, fx[0] + 12, fx[1] + 12], outline=(255, 255, 255), width=3)
+                    d3.text((fx[0] + 16, fx[1] - 6), "frontier", fill=(255, 255, 255))
+
+            header_h = 192
+            canv = Image.new("RGB", (896, header_h + 512), (20, 20, 20))
+            canv.paste(p3, (0, header_h))
+            canv.paste(pe, (512, header_h))
+
+            drw = ImageDraw.Draw(canv)
+            drw.rectangle([0, 0, 895, header_h - 1], fill=(10, 10, 10), outline=(55, 55, 55))
+            drw.line([(0, header_h - 1), (895, header_h - 1)], fill=(90, 90, 90), width=2)
+            drw.rectangle([0, header_h, 511, header_h + 511], outline=(70, 70, 70), width=2)
+            drw.rectangle([512, header_h, 895, header_h + 383], outline=(70, 70, 70), width=2)
+            drw.text((12, header_h - 22), "World view + local rollout", fill=(190, 190, 190))
+            drw.text((524, header_h - 22), "Agent / close-up view", fill=(190, 190, 190))
+
+            drw.text((20, 16), "JEPA | Fast Frontier Exploration + OOD Safety", fill=(0, 255, 100))
+            drw.text((20, 36), f"Step: {step:04d} | Coverage: {coverage:.1%} | Frontier switches: {planner.frontier_switches}", fill=(200, 200, 200))
+            drw.text((20, 56), f"Frontier dist: {frontier_dist:.2f} m | OOD raw: {current_ood_raw:.2f} | OOD rel: {current_ood_rel:.2f}", fill=(200, 200, 200))
+            drw.text((20, 76), f"Cmd: vx={float(cmd[0, 0].item()):+.2f} vy={float(cmd[0, 1].item()):+.2f} wz={float(cmd[0, 2].item()):+.2f}", fill=(200, 200, 200))
+            drw.text((20, 96), f"Plan cost: {current_info['cost']:.2f} | Novel(best): {int(current_info['novel'])} | Frontier prog: {current_info['frontier_progress']:+.2f}", fill=(200, 200, 200))
+            drw.text((20, 116), f"Pred OOD raw: {current_info['pred_ood_raw']:.2f} | Pred OOD rel: {current_info['pred_ood_rel']:.2f} | Stall: {current_info['stall']:.2f}", fill=(200, 200, 200))
+
+            draw_bar(drw, 20, 150, 165, 12, current_ood_rel, 3.0, "OOD rel", fill=(220, 90, 40))
+            draw_bar(drw, 220, 150, 165, 12, current_info["pred_ood_rel"], 3.0, "pred OOD rel", fill=(180, 80, 180))
+            draw_progress_bar(drw, 420, 150, 160, 12, coverage, "Coverage", fill=(0, 170, 255))
+            draw_progress_bar(drw, 610, 150, 160, 12, clamp(current_info["novel"] / 8.0, 0.0, 1.0), "Novel cells in local rollout", fill=(100, 210, 120))
+
+            if len(ood_history) > 2:
+                hist = np.asarray(ood_history[-90:], dtype=np.float32)
+                hmin = float(hist.min())
+                hmax = max(float(hist.max()), hmin + 0.1)
+                pts = []
+                for i, val in enumerate(hist):
+                    x_px = 20 + int(i / max(len(hist) - 1, 1) * 420)
+                    y_px = 182 - int((float(val) - hmin) / (hmax - hmin) * 34)
+                    pts.append((x_px, y_px))
+                if len(pts) > 1:
+                    drw.line(pts, fill=(255, 180, 90), width=2)
+                drw.text((20, 128), "Raw OOD history", fill=(180, 180, 180))
+
+            draw_minimap(
+                drw,
+                map_x0=540,
+                map_y0=22,
+                map_w=322,
+                map_h=138,
+                robot_xy=robot_xy,
+                robot_yaw=yaw,
+                trail=trail,
+                plan_path=planner.best_path_xy,
+                frontier_xy=planner.frontier.xy if planner.frontier is not None else None,
+                visited=visited,
+                occ=occ,
+                obstacles=obstacles,
+            )
+            drw.text((540, 164), "Blue = local rollout | Yellow = actual trail | White = active frontier", fill=(120, 120, 120))
+            writer.append_data(np.array(canv))
+        step_dt = time.perf_counter() - step_t0
         print(
             f"\r⚡ step={step:04d} | cov={coverage:.1%} | frontier={frontier_dist:.2f} | "
             f"OODraw={current_ood_raw:.2f} | OODrel={current_ood_rel:.2f} | novel={int(current_info['novel'])} | "
-            f"prog={current_info['frontier_progress']:+.2f} | cost={current_info['cost']:.2f}",
+            f"prog={current_info['frontier_progress']:+.2f} | cost={current_info['cost']:.2f} | dt={step_dt:.2f}s",
             end="",
+            flush=True,
         )
 
-    writer.close()
+    if writer is not None:
+        writer.close()
     final_cov = float((visited & (~occ)).sum()) / max(float(free_cells), 1.0)
-    print(f"\n\n✅ Exploration demo saved to {args.out}")
+    if writer is not None:
+        print(f"\n\n✅ Exploration demo saved to {args.out}")
+    else:
+        print(f"\n\n✅ Exploration demo completed (no video written)")
     print(f"   Final coverage: {final_cov:.1%}")
     print(f"   Frontier switches: {planner.frontier_switches}")
 

@@ -19,6 +19,22 @@ The main showpiece is the Genesis landmark-navigation demo:
 
 Source video: `jepa_logs/proof_of_thinking_v4_extended.mp4`
 
+## Energy Landscape
+
+The repo also includes a saved energy-landscape visualization from the learned planning head:
+
+![Energy landscape](jepa_logs/energy_landscape.png)
+
+This plot is useful for reading out what the post-hoc `GoalEnergyHead` thinks is promising in latent space. Lower-energy regions correspond to futures the model considers more compatible with the chosen goal latent, while higher-energy regions correspond to less compatible terminal states.
+
+In practice, this is the planning signal used after JEPA backbone training:
+
+- the backbone rolls candidate futures forward in latent space
+- the energy head scores their terminal latent against the goal latent
+- the planner prefers commands that land in lower-energy regions
+
+So this figure is a compact way to inspect whether the learned objective has a meaningful basin around desirable futures, instead of behaving like a flat or noisy score function.
+
 ## JEPA Pipeline
 
 ### 1. Mine trajectories in physics

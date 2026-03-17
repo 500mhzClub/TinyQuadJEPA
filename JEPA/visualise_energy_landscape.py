@@ -22,6 +22,9 @@ class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int = 50, act_dim: int = 12, hid: int = 256):
         super().__init__()
         self.actor = nn.Sequential(nn.Linear(obs_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, act_dim))
+        self.critic = nn.Sequential(nn.Linear(obs_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, 1))
+        self.log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
+        
     def act_deterministic(self, obs): return torch.tanh(self.actor(obs))
 
 class VisionEncoder(nn.Module):
@@ -122,13 +125,24 @@ def get_system1_obs(robot, q0, prev_action, cmd, act_dofs, device):
     return torch.cat([pos[:, 2:3], quat, world_to_body_vec(quat, vel_w), world_to_body_vec(quat, ang_w), q - q0.unsqueeze(0), dq, prev_action, cmd], dim=1)
 
 def get_jepa_state(robot, cam_brain, q0, prev_action, act_dofs, device):
-    img = cam_brain.render()[0].cpu().numpy()
-    vis_tensor = torch.from_numpy(np.transpose(img[:, :, :3], (2, 0, 1))).float().to(device) / 255.0
+    img = cam_brain.render()[0]
+    if hasattr(img, "cpu"):
+        img = img.cpu().numpy()
+    
+    # Adding .copy() resolves the negative stride issue after transposing
+    rgb = np.transpose(img[:, :, :3], (2, 0, 1)).copy()
+    
+    vis_tensor = torch.from_numpy(rgb).float().to(device) / 255.0
     prop_tensor = get_system1_obs(robot, q0, prev_action, torch.zeros((1, 3), device=device), act_dofs, device)[:, :47]
     return vis_tensor.unsqueeze(0), prop_tensor
 
 def move_camera(robot, cam_brain):
-    r_pos, r_quat = robot.get_pos().cpu().numpy()[0], robot.get_quat().cpu().numpy()[0]
+    r_pos = robot.get_pos().cpu().numpy()
+    r_quat = robot.get_quat().cpu().numpy()
+    
+    if r_pos.ndim > 1: r_pos = r_pos[0]
+    if r_quat.ndim > 1: r_quat = r_quat[0]
+    
     w, x, y, z = r_quat
     forward = np.array([1 - 2*(y**2 + z**2), 2*(x*y + w*z), 2*(x*z - w*y)], dtype=np.float32)
     up = np.array([2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x**2 + y**2)], dtype=np.float32)
@@ -160,7 +174,7 @@ def main():
     energy_head.eval()
 
     ppo = ActorCritic().to(device)
-    ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=device)["model"])
+    ppo.load_state_dict(torch.load(args.ppo_ckpt, map_location=device)["model"], strict=False)
     ppo.eval()
 
     scene, robot, cam_brain, act_dofs, q0 = init_genesis_scene(device)
@@ -177,7 +191,9 @@ def main():
     move_camera(robot, cam_brain)
     v_goal, p_goal = get_jepa_state(robot, cam_brain, q0, prev_a, act_dofs, device)
     z_goal = jepa.encoder(v_goal, p_goal).detach()
-    goal_pos = robot.get_pos().cpu().numpy()[0]
+    
+    goal_pos_raw = robot.get_pos().cpu().numpy()
+    goal_pos = goal_pos_raw[0] if goal_pos_raw.ndim > 1 else goal_pos_raw
 
     robot.set_pos(np.array([0.0, 0.0, 0.12], dtype=np.float32))
     robot.set_dofs_position(q0.cpu().numpy(), act_dofs)
@@ -198,7 +214,9 @@ def main():
                 z_pred = z_start.clone()
                 h_t = torch.zeros(1, 256, device=device)
                 for _ in range(args.horizon):
-                    z_pred, h_t = jepa.predictor(z_pred, torch.tensor([[VX[i, j], 0.0, OM[i, j]]], device=device), h_t)
+                    # Explicitly cast the command tensor to float32 to match the model weights
+                    cmd_t = torch.tensor([[VX[i, j], 0.0, OM[i, j]]], device=device, dtype=torch.float32)
+                    z_pred, h_t = jepa.predictor(z_pred, cmd_t, h_t)
                 ENERGIES[i, j] = float(energy_head(z_pred, z_goal).item())
 
     best_flat = int(np.argmin(ENERGIES))

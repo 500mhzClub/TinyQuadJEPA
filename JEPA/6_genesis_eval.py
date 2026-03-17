@@ -31,6 +31,10 @@ import torch.nn as nn
 from PIL import Image, ImageDraw
 import genesis as gs
 
+# Global Environment Constants
+WORLD_MIN = np.array([-2.2, -1.2], dtype=np.float32)
+WORLD_MAX = np.array([3.8, 3.8], dtype=np.float32)
+
 
 # ----------------------------------------------------------------------------
 # Models
@@ -155,7 +159,7 @@ def clean_state_dict(d: dict) -> dict:
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
+    return max(lo, min(x, hi))
 
 
 def wrap_to_pi(x: float) -> float:
@@ -430,9 +434,9 @@ def plan_best_cmd(
 
     for _ in range(5):
         cmds = mean + std * torch.randn((cands, 3), device=dev)
-        cmds[:, 0].clamp_(-0.40, 0.40)
-        cmds[:, 1].clamp_(-0.25, 0.25)
-        cmds[:, 2].clamp_(-0.60, 0.60)
+        cmds[:, 0].clamp_(-0.40, 0.40) # Max linear X bounds
+        cmds[:, 1].clamp_(-0.25, 0.25) # Max linear Y bounds
+        cmds[:, 2].clamp_(-0.60, 0.60) # Max angular Z bounds
 
         z_roll = zc.expand(cands, -1)
         h_t = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
@@ -546,10 +550,9 @@ def draw_progress_bar(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
     draw.text((x, y - 16), label, fill=(200, 200, 200))
 
 
-def world_to_map_px(xy: np.ndarray, map_x0: int, map_y0: int, map_w: int, map_h: int,
-                    world_min: np.ndarray, world_max: np.ndarray) -> Tuple[int, int]:
-    nx = (float(xy[0]) - float(world_min[0])) / max(float(world_max[0] - world_min[0]), 1e-8)
-    ny = (float(xy[1]) - float(world_min[1])) / max(float(world_max[1] - world_min[1]), 1e-8)
+def world_to_map_px(xy: np.ndarray, map_x0: int, map_y0: int, map_w: int, map_h: int) -> Tuple[int, int]:
+    nx = (float(xy[0]) - float(WORLD_MIN[0])) / max(float(WORLD_MAX[0] - WORLD_MIN[0]), 1e-8)
+    ny = (float(xy[1]) - float(WORLD_MIN[1])) / max(float(WORLD_MAX[1] - WORLD_MIN[1]), 1e-8)
     px = map_x0 + int(np.clip(nx, 0.0, 1.0) * map_w)
     py = map_y0 + map_h - int(np.clip(ny, 0.0, 1.0) * map_h)
     return px, py
@@ -606,44 +609,41 @@ def draw_minimap(
     teleport_to_xy: Optional[np.ndarray] = None,
     teleport_flash: int = 0,
 ):
-    world_min = np.array([-2.2, -1.2], dtype=np.float32)
-    world_max = np.array([3.8, 3.8], dtype=np.float32)
-
     draw.rectangle([map_x0, map_y0, map_x0 + map_w, map_y0 + map_h], fill=(18, 18, 18), outline=(95, 95, 95))
 
-    for gx in np.linspace(world_min[0], world_max[0], 7):
-        p0 = world_to_map_px(np.array([gx, world_min[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
-        p1 = world_to_map_px(np.array([gx, world_max[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+    for gx in np.linspace(WORLD_MIN[0], WORLD_MAX[0], 7):
+        p0 = world_to_map_px(np.array([gx, WORLD_MIN[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h)
+        p1 = world_to_map_px(np.array([gx, WORLD_MAX[1]], dtype=np.float32), map_x0, map_y0, map_w, map_h)
         draw.line([p0, p1], fill=(35, 35, 35), width=1)
-    for gy in np.linspace(world_min[1], world_max[1], 6):
-        p0 = world_to_map_px(np.array([world_min[0], gy], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
-        p1 = world_to_map_px(np.array([world_max[0], gy], dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+    for gy in np.linspace(WORLD_MIN[1], WORLD_MAX[1], 6):
+        p0 = world_to_map_px(np.array([WORLD_MIN[0], gy], dtype=np.float32), map_x0, map_y0, map_w, map_h)
+        p1 = world_to_map_px(np.array([WORLD_MAX[0], gy], dtype=np.float32), map_x0, map_y0, map_w, map_h)
         draw.line([p0, p1], fill=(35, 35, 35), width=1)
 
     route_colors = [(255, 80, 80), (80, 255, 80), (80, 140, 255)]
 
-    world_span_x = float(world_max[0] - world_min[0])
-    world_span_y = float(world_max[1] - world_min[1])
+    world_span_x = float(WORLD_MAX[0] - WORLD_MIN[0])
+    world_span_y = float(WORLD_MAX[1] - WORLD_MIN[1])
     px_per_m_x = map_w / max(world_span_x, 1e-8)
     px_per_m_y = map_h / max(world_span_y, 1e-8)
     goal_r_px = max(3, int(dist_thresh * 0.5 * (px_per_m_x + px_per_m_y)))
 
     if len(route) > 1:
-        pts = [world_to_map_px(waypoints[idx].pos[:2], map_x0, map_y0, map_w, map_h, world_min, world_max) for idx in route]
+        pts = [world_to_map_px(waypoints[idx].pos[:2], map_x0, map_y0, map_w, map_h) for idx in route]
         draw.line(pts, fill=(120, 120, 120), width=2)
 
     if len(trail) > 1:
-        trail_pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h, world_min, world_max) for t in trail[-240:]]
+        trail_pts = [world_to_map_px(t, map_x0, map_y0, map_w, map_h) for t in trail[-240:]]
         if len(trail_pts) > 1:
             draw.line(trail_pts, fill=(255, 214, 10), width=2)
 
     if plan_path is not None and len(plan_path) > 1:
-        plan_pts = [world_to_map_px(pt, map_x0, map_y0, map_w, map_h, world_min, world_max) for pt in plan_path]
+        plan_pts = [world_to_map_px(pt, map_x0, map_y0, map_w, map_h) for pt in plan_path]
         draw.line(plan_pts, fill=(0, 170, 255), width=3)
 
     active_idx = route[route_ptr]
     for wi, wp in enumerate(waypoints):
-        px, py = world_to_map_px(wp.pos[:2], map_x0, map_y0, map_w, map_h, world_min, world_max)
+        px, py = world_to_map_px(wp.pos[:2], map_x0, map_y0, map_w, map_h)
         col = route_colors[wi]
         ring_col = (255, 255, 255) if wi == active_idx else (90, 90, 90)
         draw.ellipse([px - goal_r_px, py - goal_r_px, px + goal_r_px, py + goal_r_px], outline=ring_col, width=2)
@@ -652,8 +652,8 @@ def draw_minimap(
         draw.text((px + goal_r_px + 6, py - 8), f"W{wi + 1} x{visit_counts.get(wi, 0)}", fill=col)
 
     if teleport_flash > 0 and teleport_from_xy is not None and teleport_to_xy is not None:
-        p_from = world_to_map_px(np.asarray(teleport_from_xy, dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
-        p_to = world_to_map_px(np.asarray(teleport_to_xy, dtype=np.float32), map_x0, map_y0, map_w, map_h, world_min, world_max)
+        p_from = world_to_map_px(np.asarray(teleport_from_xy, dtype=np.float32), map_x0, map_y0, map_w, map_h)
+        p_to = world_to_map_px(np.asarray(teleport_to_xy, dtype=np.float32), map_x0, map_y0, map_w, map_h)
         draw_dashed_line(draw, p_from, p_to, dash=7, gap=5, fill=(255, 220, 110), width=3)
         for px, py, fill_col, lab in [
             (p_from[0], p_from[1], (255, 120, 80), "before"),
@@ -666,7 +666,7 @@ def draw_minimap(
         draw.rounded_rectangle([mx0, my0, mx0 + 196, my0 + 18], radius=5, fill=(88, 28, 10), outline=(255, 200, 100), width=2)
         draw.text((mx0 + 8, my0 + 2), "teleport / relocalize", fill=(255, 235, 190))
 
-    rx, ry = world_to_map_px(robot_xy, map_x0, map_y0, map_w, map_h, world_min, world_max)
+    rx, ry = world_to_map_px(robot_xy, map_x0, map_y0, map_w, map_h)
     head = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], dtype=np.float32)
     left = np.array([math.cos(robot_yaw + 2.5), math.sin(robot_yaw + 2.5)], dtype=np.float32)
     right = np.array([math.cos(robot_yaw - 2.5), math.sin(robot_yaw - 2.5)], dtype=np.float32)
@@ -747,6 +747,7 @@ def main():
     prev_cmd = None
     route_ptr = 0
     target_wp_idx = route[route_ptr]
+    goal_xy = waypoints[target_wp_idx].pos[:2]
     ema_energy = 0.0
     ema_alpha = 0.30
     energy_history: List[float] = []
@@ -766,7 +767,6 @@ def main():
         print(f"   Kidnap event: route target #{args.kidnap_on_route_idx} after {args.kidnap_after_leg_steps} steps")
 
     for step in range(args.n_steps):
-        target_wp_idx = route[route_ptr]
 
         cep, cel, ceu, c3p, c3l, c3u = move_cams(robot, cb, ce, c3)
         v, p = get_jepa_state(robot, cb, q0, pa, dofs, dev)
@@ -787,7 +787,6 @@ def main():
 
         trail.append(rp[:2].copy())
 
-        goal_xy = waypoints[target_wp_idx].pos[:2]
         dist = float(np.linalg.norm(rp[:2] - goal_xy))
 
         if dist < args.dist_thresh:
@@ -802,7 +801,7 @@ def main():
             prev_cmd = None
             leg_steps = 0
             goal_xy = waypoints[target_wp_idx].pos[:2]
-            dist = float(np.linalg.norm(rp[:2] - goal_xy))
+            dist = float(np.linalg.norm(rp[:2] - goal_xy)) # Refresh dist to new goal immediately
 
         yaw = math.atan2(
             2.0 * (float(rq[0]) * float(rq[3]) + float(rq[1]) * float(rq[2])),
@@ -813,14 +812,17 @@ def main():
                 and leg_steps >= args.kidnap_after_leg_steps):
             old_xy = rp[:2].copy()
             new_xy = rp[:2] + np.array([args.kidnap_dx, args.kidnap_dy], dtype=np.float32)
-            new_xy[0] = clamp(float(new_xy[0]), -1.8, 2.8)
-            new_xy[1] = clamp(float(new_xy[1]), -0.8, 2.8)
+            new_xy[0] = clamp(float(new_xy[0]), float(WORLD_MIN[0]) + 0.4, float(WORLD_MAX[0]) - 1.0)
+            new_xy[1] = clamp(float(new_xy[1]), float(WORLD_MIN[1]) + 0.4, float(WORLD_MAX[1]) - 1.0)
             new_yaw = wrap_to_pi(yaw + math.radians(args.kidnap_dyaw_deg))
+            
             robot.set_pos(np.array([new_xy[0], new_xy[1], 0.12], dtype=np.float32))
             robot.set_quat(yaw_to_quat(new_yaw))
             robot.set_dofs_position(robot.get_dofs_position(dofs).detach().cpu().numpy(), dofs)
+            
             for _ in range(12):
                 scene.step()
+                
             kidnap_used = True
             kidnap_flash = args.teleport_banner_frames
             kidnap_from_xy = old_xy

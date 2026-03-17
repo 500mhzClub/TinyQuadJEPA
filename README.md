@@ -1,375 +1,189 @@
-# TinyQuadJEPA: current architecture, what it is, and where it should go next
+# TinyQuadJEPA
 
-## Overview
+TinyQuadJEPA is a two-level quadruped stack:
 
-This repository currently implements a **two-level control stack** for a Mini Pupper style quadruped:
+- `System 1`: a PPO locomotion policy that turns body-frame commands into 12 joint targets.
+- `System 2`: a JEPA-style latent world model that encodes RGB + proprioception, predicts future latents under commanded motion, and supports latent-space planning.
 
-- **System 1**: a low-level PPO locomotion controller that turns a high-level body-frame command into joint targets.
-- **System 2**: an action-conditioned latent dynamics model that encodes vision + proprioception into a joint latent state and predicts the next latent under a commanded body velocity.
+The current repository is best described as:
 
-The current System 2 is best described as:
+> an action-conditioned latent predictor trained with a VICReg objective, plus a post-hoc learned energy head for planning
 
-> **an action-conditioned JEPA-style latent world model trained with a VICReg objective**
+It is JEPA-style because prediction happens in latent space instead of pixel reconstruction. It is not yet a canonical EMA-target JEPA.
 
-It is **JEPA-like** because it predicts in latent space rather than reconstructing pixels. It is **not yet a true learned EBM** because the current “energy” is a hand-defined latent distance / VICReg objective, not a separately learned scalar compatibility function.
+## Demo
 
----
+The main showpiece is the Genesis landmark-navigation demo:
 
-## High-level architecture
+![TinyQuadJEPA demo](jepa_logs/proof_of_thinking_v4_extended.gif)
 
-```text
-RGB camera (64x64) ----> VisionEncoder ----\
-                                             > JointEncoder -> z_t (256-d latent)
-Proprio state (47-d) -> ProprioEncoder ----/
+Source video: `jepa_logs/proof_of_thinking_v4_extended.mp4`
 
-z_t + cmd_t (vx, vy, wz) -> LatentPredictor (GRUCell) -> ẑ_{t+1}
+## JEPA Pipeline
+
+### 1. Mine trajectories in physics
+
+`JEPA/1_physics_rollout.py` runs the frozen PPO walking controller in Genesis across many parallel environments and records:
+
+- noisy proprioception
+- commanded body velocities `(vx, vy, wz)`
+- episode termination flags
+- base pose
+- joint positions
+
+Output: compressed `.npz` chunks in `jepa_raw_data/`
+
+### 2. Render egocentric vision
+
+`JEPA/2_visual_renderer.py` replays the recorded rollouts and renders a 64x64 onboard RGB stream into HDF5, alongside the recorded proprio, commands, and done flags.
+
+Output: `jepa_final_dataset/*_rgb.h5`
+
+Dataset fields:
+
+- `vision`: `(N, T, 3, 64, 64)` uint8
+- `proprio`: `(N, T, 47)`
+- `cmds`: `(N, T, 3)`
+- `dones`: `(N, T)`
+
+### 3. Train the JEPA backbone
+
+`JEPA/train_jepa.py` trains the backbone on 16-step windows from the rendered dataset.
+
+Architecture:
+
+- `VisionEncoder`: 4 conv layers -> 128-d feature
+- `ProprioEncoder`: MLP -> 128-d feature
+- `JointEncoder`: fused 256-d latent
+- `LatentPredictor`: action-conditioned `GRUCell` transition model
 
 Training target:
-RGB_{t+1}, proprio_{t+1} -> JointEncoder -> z_{t+1}
-
-Loss:
-VICReg(ẑ_{t+1}, z_{t+1}) = sim + var + cov
-```
-
-At deployment time:
-
-```text
-current observation -> z_t
-candidate commands -> rollout predictor in latent space
-pick command with lowest terminal latent cost to goal waypoint
-send chosen high-level command to PPO controller
-PPO produces 12 joint actions
-joint position targets drive the robot
-```
-
----
-
-## Current modules
-
-### 1. Vision encoder
-
-The visual stream is a compact convolutional encoder:
-
-- 4 convolution blocks with ELU activations
-- stride-2 downsampling
-- flatten + linear projection
-- LayerNorm on the 128-d visual feature
-
-Its job is not to decode images or preserve every detail. Its job is to produce a compact representation that is useful for future prediction and control.
-
-### 2. Proprio encoder
-
-The proprioceptive stream maps the 47-d robot state into a 128-d feature with:
-
-- linear -> ELU -> linear
-- LayerNorm on the final feature
-
-This gives System 2 access to body state, joint state, and motion cues alongside vision.
-
-### 3. Joint encoder
-
-The visual and proprio features are concatenated and fused into a **256-d latent state**.
-
-This latent is the internal “state of the world as far as the planner cares about it”.
-
-### 4. Latent predictor
-
-The predictor is an **action-conditioned recurrent transition model**:
-
-- input: `[z_t ; cmd_t]`
-- input projection with ELU
-- `GRUCell` hidden state of size 256
-- output projection back to latent space
-
-This means the model is not only predicting “what happens next”, but “what happens next **if I command this body velocity**”.
-
-### 5. System 1 controller
-
-System 1 is a PPO locomotion policy that takes a 50-d observation and outputs 12 bounded actions. The action is turned into joint position targets relative to a nominal standing pose.
-
-System 2 does **not** directly output joint torques or joint angles. It outputs a **high-level command** `(vx, vy, wz)` which System 1 executes.
-
-That separation is good design for your setting:
-
-- System 1 handles fast local motor control.
-- System 2 handles slower latent-space planning.
-
----
-
-## Training objective
-
-The current training objective is VICReg-style prediction matching.
-
-For each time step:
 
 - encode `(vision_t, proprio_t)` to `z_t`
-- predict `ẑ_{t+1}` from `z_t` and `cmd_t`
+- predict `z_hat_{t+1}` from `(z_t, cmd_t, h_t)`
 - encode `(vision_{t+1}, proprio_{t+1})` to `z_{t+1}`
-- apply VICReg between `ẑ_{t+1}` and `z_{t+1}`
+- apply VICReg loss between `z_hat_{t+1}` and `z_{t+1}`
 
-The total loss is:
-
-```text
-L = 25 * L_sim + 25 * L_var + 1 * L_cov
-```
-
-where:
-
-- `L_sim`: MSE between predicted and target latents
-- `L_var`: variance floor penalty to avoid collapse
-- `L_cov`: decorrelation penalty to reduce feature redundancy
-
-This makes the model:
-
-- **predictive** via similarity loss
-- **non-collapsed** via variance loss
-- **less entangled** via covariance loss
-
----
-
-## Why this is JEPA-style
-
-A JEPA predicts a target representation from context, instead of reconstructing pixels.
-
-Your current setup does exactly that:
-
-- context = current latent state + command
-- target = latent encoding of the next observation
-- prediction is carried out entirely in latent space
-
-That makes it a valid **JEPA-style latent predictor**.
-
----
-
-## Why this is not yet a true EBM
-
-Right now, “energy” means one of two things:
-
-1. the weighted VICReg training loss during optimisation, or
-2. a hand-crafted planning cost such as cosine distance between a predicted latent and a goal latent.
-
-A **true learned EBM** would instead learn a scalar function such as:
+Current VICReg weights in code:
 
 ```text
-E(context, action_seq, goal) -> scalar
+25 * sim + 25 * var + 1 * cov
 ```
 
-with the property that:
+Outputs:
 
-- compatible / good futures have **low energy**
-- incompatible / bad futures have **high energy**
+- checkpoints in `jepa_checkpoints/`
+- CSV metrics in `jepa_logs/training_metrics.csv`
 
-That energy would itself be a learned object, not just a distance metric chosen by hand.
+### 4. Train the energy head
 
-So the current system is better named:
+`JEPA/train_energy_head.py` loads a trained JEPA backbone and learns a scalar compatibility function on top of it.
 
-> **TinyQuadJEPA: action-conditioned latent predictor with VICReg training**
+For each sequence it:
 
-and not yet:
+- rolls the latent predictor forward for `H` steps under the recorded commands
+- encodes the true latent at step `H`
+- trains `GoalEnergyHead(z_pred_H, z_goal_H)` with in-batch negative goals
 
-> **true JEPA EBM**
+This is the part of the repo that behaves most like a learned planning objective.
 
----
+Outputs:
 
-## Current strengths
+- checkpoints in `energy_head_checkpoints/`
+- CSV metrics in `energy_head_logs/energy_head_metrics.csv`
 
-- clean split between low-level motor skill and high-level planning
-- multimodal latent state from vision + proprioception
-- recurrent action-conditioned predictor
-- no obvious representational collapse
-- suitable for waypoint chasing and short-horizon planning demos
-- good baseline before moving to a more canonical JEPA design
+### 5. Run the closed-loop demo
 
----
+`JEPA/6_genesis_eval.py` is the main end-to-end showcase.
 
-## Current limitations
+It loads:
 
-1. **No target/EMA encoder**
-   - the same encoder is used on both sides of the prediction task.
+- the PPO controller
+- the JEPA backbone
+- the trained energy head
 
-2. **No explicit masking / abstraction mechanism**
-   - the model is asked to match next-step latent state directly.
-   - this is useful, but less canonical than a masked predictive JEPA setup.
+It then:
 
-3. **No learned energy head**
-   - planning cost is latent distance, not a trained energy network.
+- harvests latent breadcrumbs for landmark approaches
+- plans in latent space over sampled command sequences
+- drives the robot through a waypoint route
+- optionally injects a kidnap / relocalization event
+- renders a HUD with minimap, route progress, and energy traces
 
-4. **Short-horizon control objective**
-   - evaluation mostly demonstrates whether local waypoint chasing works.
+Default output:
 
-5. **Planner currently searches simple command families**
-   - useful for demos, but not yet a rich trajectory optimiser.
+- `jepa_logs/proof_of_thinking_v4_extended.mp4`
 
----
+## Quick Start
 
-## Recommended evaluation philosophy for the current run
+### Build the dataset
 
-At this stage, evaluation should answer three different questions.
-
-### A. Is the model alive?
-
-Sanity-check metrics:
-
-- training loss trending down
-- similarity loss trending down
-- variance penalty near zero
-- covariance penalty steadily decreasing
-- latent rollouts stay numerically stable
-
-### B. Does it predict useful latent dynamics?
-
-Offline checkpoint evaluation on held-out rollouts:
-
-- 1-step latent error
-- H-step latent rollout error for H in {1, 3, 5, 10, 15}
-- cosine similarity to true future latents
-- ranking quality of commands by physical progress vs latent score
-
-### C. Can it produce a compelling demo?
-
-Closed-loop simulator demos:
-
-- latent waypoint chasing
-- slalom navigation
-- energy landscape plots
-- side-by-side ego / 3rd person video with planning HUD
-
-For your current repo stage, **C is acceptable for presentation**, but **A and B are what make the model development trustworthy**.
-
----
-
-## Further work: how to make this a more canonical JEPA
-
-### 1. Add a target encoder
-
-Move from:
-
-```text
-z_target = encoder(next_obs)
+```bash
+python JEPA/1_physics_rollout.py --ckpt <ppo_checkpoint>
+python JEPA/2_visual_renderer.py --workers 4
+python JEPA/verify_dataset.py
 ```
 
-to:
+### Train the backbone
 
-```text
-z_target = target_encoder(next_obs)
+```bash
+python JEPA/train_jepa.py
 ```
 
-where `target_encoder` is an EMA copy of the online encoder.
+Resume:
 
-Why:
-
-- stabilises targets
-- makes training more canonical for joint-embedding methods
-- reduces representational drift
-
-### 2. Predict a goal-conditioned or masked target representation
-
-Instead of only predicting the immediate next latent, make the task more JEPA-like by predicting a target representation from:
-
-- partial context
-- masked observations
-- future offset(s)
-- goal-conditioned future states
-
-Possible extensions:
-
-- random future offset prediction
-- multi-head predictor for horizons 1, 3, 5, 10, 15
-- masked visual context with proprio retained
-
-### 3. Add a learned energy head
-
-Introduce something like:
-
-```text
-E_theta(z_context, cmd_seq, z_goal) -> scalar
+```bash
+python JEPA/train_jepa.py --resume_from jepa_checkpoints/jepa_epoch_8_step_3000.pt
 ```
 
-or
+### Train the energy head
 
-```text
-E_theta(z_pred, z_goal) -> scalar
+```bash
+python JEPA/train_energy_head.py \
+  --jepa_ckpt jepa_checkpoints/jepa_epoch_20.pt \
+  --data_dir jepa_final_dataset \
+  --device cuda
 ```
 
-Train it with contrastive / ranking structure:
+### Generate the navigation demo
 
-- positive: actual future / successful command sequence
-- negatives: mismatched goals, shuffled commands, failed futures, off-trajectory samples
+```bash
+python JEPA/6_genesis_eval.py \
+  --jepa_ckpt jepa_checkpoints/jepa_epoch_20.pt \
+  --head_ckpt energy_head_checkpoints/energy_head_best.pt \
+  --ppo_ckpt <ppo_checkpoint>
+```
 
-Loss candidates:
+## Repo Map
 
-- hinge / margin ranking loss
-- InfoNCE style contrastive objective
-- binary logistic energy discrimination
+- `JEPA/1_physics_rollout.py`: physics rollout mining
+- `JEPA/2_visual_renderer.py`: egocentric RGB rendering into HDF5
+- `JEPA/train_jepa.py`: VICReg latent dynamics training
+- `JEPA/train_energy_head.py`: learned scalar energy training
+- `JEPA/mpc_inference.py`: standalone latent MPC example
+- `JEPA/6_genesis_eval.py`: closed-loop Genesis demo
+- `JEPA/verify_dataset.py`: GIF spot-check export
+- `sim/`: locomotion and simulator support code
+- `assets/mini_pupper/`: robot URDF and meshes
 
-This is the main step that would justify the **EBM** label.
+## Current Status
 
-### 4. Separate predictable from unpredictable content
+What is already strong:
 
-A canonical JEPA should not be forced to model every pixel-level detail.
+- clean separation between low-level locomotion and high-level planning
+- multimodal latent state from RGB + proprioception
+- recurrent action-conditioned dynamics model
+- learned scalar energy head for terminal-goal compatibility
+- compelling closed-loop demo pipeline
 
-You can push the latent to represent controllable, task-relevant structure by:
+What is still incomplete:
 
-- predicting only a projector head rather than raw latent
-- using stop-gradient target branches
-- using uncertainty-aware or latent bottleneck heads
-- adding invariance augmentations
+- no EMA / target encoder
+- no masked predictive objective
+- no explicit offline benchmark suite for multi-step prediction quality
+- planning still samples command families rather than running a stronger optimizer
 
-### 5. Upgrade the planner
+## Notes
 
-After the model is stable:
-
-- move from constant command rollouts to command sequences
-- use CEM / MPPI over body-frame commands
-- optionally learn a value head over latent-goal compatibility
-- evaluate how latent score correlates with true task success
-
-### 6. Add held-out offline evaluation
-
-This is the most important missing benchmark.
-
-Create a proper validation script that:
-
-- loads held-out rollouts
-- computes teacher-forced and free-running latent rollout error
-- logs results per checkpoint
-- plots horizon-vs-error curves
-
----
-
-## Suggested roadmap
-
-### Phase 1: finish the baseline cleanly
-
-- finish the current 20-epoch run
-- save the best checkpoint(s)
-- generate polished demo videos
-- collect a small set of fixed evaluation plots
-- document exactly what the current model is
-
-This gives you a stable baseline and a clean “version 0” story.
-
-### Phase 2: canonical JEPA pass
-
-Fork a new branch and add:
-
-- EMA target encoder
-- improved evaluation suite
-- optional multi-horizon predictor heads
-- stronger offline metrics
-
-### Phase 3: true JEPA EBM pass
-
-Add:
-
-- learned energy head
-- positives / negatives / ranking loss
-- goal-conditioned energy planning
-- command-sequence planning
-
-At that point, the system can be presented as a **JEPA + learned energy-based planner**.
-
-
-## One-line project description
-
-> **TinyQuadJEPA is a two-level quadruped control stack in which a PPO locomotion controller executes high-level body commands selected by an action-conditioned multimodal latent predictor trained with a VICReg-style JEPA objective.**
+- The top-level README is intended to be the authoritative overview for the current code.
+- Some older comments and side docs in `JEPA/` still describe earlier iterations of the design.
